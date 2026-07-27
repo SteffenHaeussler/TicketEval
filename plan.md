@@ -1,451 +1,717 @@
 # Ticketflow Eval Harness
 
-**Status:** planned, not started · **Date:** 2026-07-27
+**Status:** revised plan, not started · **Date:** 2026-07-27
 
-## Context
+## Summary
 
-Ticketflow is a Temporal learning project: a mocked agent resolves support tickets in a durable
-workflow, with a human-approval gate for refunds and low-confidence drafts. Today there is **no
-evaluation of any kind** — a repo-wide grep for `eval|scor|metric|judge|benchmark|golden|ground truth`
-returns zero hits. The only quantitative output is two histograms printed by `scripts/batch.py`.
+Ticketflow has a mocked agent, a durable Temporal workflow, and a human-approval gate for
+refunds and low-confidence drafts, but it has no evaluation harness. In particular, nobody can
+currently answer:
 
-That leaves the system's central design decision unmeasured. `CONFIDENCE_THRESHOLD = 0.75`
-(`workflows.py:30`) decides which tickets a human sees. If the agent's `confidence` doesn't
-correlate with correctness, the approval gate is theatre — it costs human review time and catches
-nothing. Nobody can currently answer: *how many wrong replies reach customers unreviewed, and what
-would a different threshold cost?*
+1. How often does an incorrect structured outcome reach a customer without review?
+2. How does changing `CONFIDENCE_THRESHOLD = 0.75` trade unreviewed errors against review load?
+3. How much quality is lost when the fallback model is used?
+4. Does the workflow route to fallback correctly under operational pressure?
 
-A second claim is also unfalsifiable. `docs/context.md:92-101` states *"degraded service beats an
-outage, and the degradation should be measurable downstream."* But `MockAgent.fallback()` merely
-**stipulates** degradation by capping confidence at 0.6 (`mock.py:76`). Nothing measures whether the
-fallback path actually produces acceptable answers.
+The harness will run a labelled ticket dataset through the real `TicketWorkflow` in process. It
+will keep four concerns separate:
 
-**Goal:** a harness that runs a labelled ticket dataset through the real workflow and reports three
-coupled things — agent output quality, system/policy behavior, and the tradeoff curve between
-unreviewed errors and human review load. It runs against a tunable mock (free, CI-safe, and how we
-verify the harness itself is correct) and against real models served by local Ollama.
+- **Model quality:** primary and fallback models evaluated independently on the same cases.
+- **Reviewer policy:** oracle and rubber-stamp decisions applied to identical agent outputs.
+- **Operational reliability:** retries, timeouts, cache use, and real fallback routing.
+- **Reply quality:** offline LLM judging, reported only after judge calibration passes.
 
-**Non-goal:** replacing `scripts/batch.py` or the smoke tests. Those cover the live Docker stack;
-this harness runs in-process.
+Approximately 50 initial cases are enough to prove that the harness works and provide directional
+results. Approximately 200 verified cases are the target before treating results as
+decision-grade.
 
----
+**Non-goals:**
 
-## Environment (verified on this machine)
-
-- Apple M5 Pro, **64 GB** unified memory. Ollama **0.30.10**.
-- `qwen3.6:35b` — 23 GB, family `qwen35moe` (**MoE**, so far faster than 36B dense suggests),
-  context 262144, capabilities `vision, completion, tools, thinking`
-- `gemma4:26b` — 17 GB, dense 25.8B, capabilities `completion, tools, thinking`
-- `qwen2.5-coder:1.5b` — 986 MB, dense 1.5B
-
-Ollama 0.30.10 fully supports JSON-schema structured output via `format`, so no prompt-embedded
-schema fallback is needed.
-
-### Model roles
-
-| Role | Model | Rationale |
-|---|---|---|
-| Agent, primary | `qwen3.6:35b` | MoE → fast; `tools`; huge context |
-| Agent, fallback | `qwen2.5-coder:1.5b` | Genuinely degraded at ~1 GB and near-zero latency. Turns the "degradation is measurable" claim into an actual measurement. |
-| Judge | `gemma4:26b` | Different model family from the agent — the strongest judge independence available here. Dense-model slowness is irrelevant; it runs offline in phase 2. |
-
-qwen (23 GB) + gemma (17 GB) = 40 GB, which fits under Ollama's default budget but leaves no
-headroom for KV cache. **They are therefore never resident simultaneously** — see two-phase
-execution below.
-
-*Known weakness, accepted:* the 1.5B is a *coder* model, so it's an artificial stand-in for "a
-smaller general model." The absolute degradation number won't transfer to a real production fallback
-choice. A cleaner qwen-vs-gemma comparison is available for free at any time by re-running the
-harness with `--model gemma4:26b` and diffing via `compare.py` — no extra machinery.
-
-*Escape hatch:* every role is bound by an env var, so collapsing to a single model (qwen as agent,
-fallback **and** judge) if memory or latency proves troublesome is a config change, not a code
-change — set `TICKETFLOW_OLLAMA_JUDGE_MODEL=qwen3.6:35b`. The cost is self-grading bias, which the
-judge agreement check (Milestone 3) will surface rather than hide.
+- Replacing `scripts/batch.py`, Docker smoke tests, or tracing tests.
+- Running real-model evaluation in normal CI.
+- Changing Temporal-crossing ticket, workflow, or result models.
+- Treating category correctness as proof that a customer-facing reply is correct.
 
 ---
 
-## Key constraints discovered
+## Verified local environment and model roles
 
-| Constraint | Source | Consequence |
-|---|---|---|
-| `TicketResult` has no category/action/confidence | `models.py:84` | Runner must capture `TicketStatusInfo` from the **live workflow query** before termination. Outcomes cannot be reconstructed from the read model. |
-| `AGENT_ACTIVITY_TIMEOUT = 2 minutes` | `workflows.py:33` | **Highest risk.** A thinking model exceeding it retries and eventually escalates, silently turning latency into fake "model failures" and corrupting every reliability metric. |
-| Both big models advertise `thinking` | `/api/tags` | Pass `think=false` for agent calls. Judge may think freely (offline). |
-| Temporal-crossing models may only gain *defaulted* fields | `docs/context.md:132-145` | Design keeps **all** eval data outside the payloads. No model changes at all. |
-| `MockAgent._rng` is one RNG shared across all tickets | `mock.py:61` | Seeded runs are concurrency-dependent. New mock must derive a per-ticket RNG. |
-| `MockAgent` defaults `failure_rate=0.1` | `mock.py:54` | 10% injected `AgentOverloadedError` confounds quality metrics. Must be a profile knob. |
-| Agent is hardcoded at worker construction | `llm_worker.py:31,36`, `worker.py:30` | No config-driven selection exists. This is the blocker; it's Milestone 1. |
-| `model_path` = `f"{cls.model}/{draft.model}"` | `workflows.py:209` | Fallback detection depends on the literal strings `primary`/`fallback`. **Ollama agents keep those labels**; real model names go in run metadata. |
-| `workflows.py` snapshots config into module constants at import | `workflows.py:35-37` | Env vars set after import have no effect; monkeypatch module attrs (as `test_workflow.py:144` does). |
-| ruff enforces `D100-D107` on `src/` and `scripts/`, line length 88 | `pyproject.toml:44-53` | Docstrings mandatory on every new module/class/public function. `tests/` exempt. |
+- Apple M5 Pro with 64 GB unified memory.
+- Ollama 0.30.10.
+- Primary agent: `qwen3.6:35b` (23 GB).
+- Fallback agent: `qwen2.5-coder:1.5b` (986 MB).
+- Judge: `gemma4:26b` (17 GB).
+
+The primary and judge models must not be resident simultaneously. Workflow execution and judging
+therefore remain separate phases:
+
+1. Run workflows with the primary or fallback agent and persist immutable records.
+2. Unload agent models with `keep_alive=0`.
+3. Load the judge and write a separate, versioned judgment artifact.
+
+The fallback coder model is an intentionally degraded stand-in, not a production recommendation.
+Its absolute score is not assumed to transfer to another fallback model.
+
+---
+
+## Important repository constraints
+
+| Constraint | Consequence |
+|---|---|
+| The workflow falls back only after a primary **schedule-to-start** timeout. | Model degradation and fallback routing require separate run profiles. |
+| `AGENT_HEARTBEAT_TIMEOUT` is 30 seconds. | Long Ollama calls need periodic activity heartbeats, even when the start-to-close timeout is wider. |
+| `TicketResult` omits classification, draft, and decision. | Query `TicketWorkflow.status` after completion; completed workflows remain queryable while history is retained. |
+| Workflow configuration is copied into module constants at import. | The harness must configure and snapshot workflow constants before starting workers. |
+| The current test helper hosts only one agent queue. | The harness must support independently injected primary and fallback agents and queues. |
+| `MockAgent` uses one mutable RNG. | The tunable eval agent must derive randomness from stable per-ticket hashes. |
+| `model_path` depends on literal `primary` and `fallback` labels. | Real model names belong in the manifest; agent outputs retain role labels. |
+| Source modules require docstrings and line length 88. | All new modules and public APIs follow existing Ruff rules. |
 
 ---
 
 ## Architecture
 
-```
+```text
 evals/
-  data/tickets.jsonl              # labelled dataset (~50 cases -> ~200)
-  data/judge_calibration.jsonl    # ~12 hand-scored replies, to validate the judge
-  runs/<run_id>/{manifest.json, records.jsonl, report.md}
-  cache/                          # ollama response cache (gitignored)
+  data/
+    tickets.jsonl
+    labeling.md
+    judge_calibration.jsonl
+  runs/<run_id>/
+    manifest.json
+    records.jsonl
+    calls.jsonl
+    judgments/<rubric_hash>.jsonl
+    report.md
+  cache/
 
-src/ticketflow/agent/
-  base.py         # UNCHANGED - the Agent Protocol
-  mock.py         # UNCHANGED
-  tunable.py      # NEW  TunableMockAgent - label-aware, knobs for error rate + overconfidence
-  ollama.py       # NEW  OllamaAgent + shared schema-constrained httpx client
-  __init__.py     # NEW  build_agent(role) factory (file is currently empty)
+src/ticketflow/
+  agent/
+    tunable.py
+    ollama.py
+  eval/
+    dataset.py
+    records.py
+    harness.py
+    runner.py
+    reviewers.py
+    telemetry.py
+    cache.py
+    preflight.py
+    statistics.py
+    compare.py
+    report.py
+    scorers/
+      deterministic.py
+      calibration.py
+      judge.py
 
-src/ticketflow/eval/
-  dataset.py      # EvalCase model + JSONL loader
-  harness.py      # worker/env construction (moved from tests/helpers.py)
-  runner.py       # phase 1: drives cases through TicketWorkflow, applies reviewer policy
-  records.py      # CaseRecord + RunManifest
-  reviewers.py    # oracle / rubber_stamp approval policies
-  preflight.py    # ollama reachability + latency probe + timeout widening
-  statistics.py   # bootstrap CIs clustered by case; paired run-vs-run tests
-  scorers/deterministic.py
-  scorers/calibration.py
-  scorers/judge.py    # phase 2: offline batch judging over records.jsonl
-  report.py       # markdown + console output
-  compare.py      # run-vs-baseline diff (paired)
-
-scripts/eval.py   # CLI, following the scripts/batch.py precedent
+scripts/eval.py
 ```
 
-### Two-phase execution (this is what keeps memory sane)
-
-**Phase 1 — workflows.** Run every case through `TicketWorkflow` using only the agent models
-(qwen 23 GB + 1.5b ≈ 24 GB resident). Write `records.jsonl`.
-
-**Phase 2 — judging.** Unload the agent models (`POST /api/generate` with `keep_alive: 0`), then
-batch-judge the stored `reply_text` values with gemma (17 GB resident). Write judge scores back.
-
-One model swap per run instead of 2N. It also makes judging **re-runnable without re-running
-workflows** — you can iterate on the rubric for free, which matters because rubrics always need
-iteration.
-
-### Why in-process Temporal, not the live stack
-
-`tests/conftest.py::env` (`WorkflowEnvironment`) + `tests/helpers.py::make_worker` already run a
-real ticket end-to-end through a real `TicketWorkflow` with any `Agent`, no Docker and no API. It
-also hands us the `WorkflowHandle` directly — which we need, because approvals go through
-`handle.execute_update(TicketWorkflow.submit_approval, ...)` and the rich per-case data only exists
-in `handle.query(TicketWorkflow.status)`. Going through HTTP would add a process boundary and buy
-nothing the smoke tests don't already cover.
-
-**Refactor required:** `make_worker` and `CombinedWorker` move from `tests/helpers.py` into
-`src/ticketflow/eval/harness.py`. `tests/helpers.py` re-exports them so the 16 existing tests in
-`test_workflow.py` keep working unchanged.
+`records.jsonl` and `calls.jsonl` are immutable raw artifacts. Re-running the judge creates a new
+file under `judgments/`; it never rewrites raw workflow output.
 
 ---
 
-## Milestone 1 — Agent seam (prerequisite)
+## Evaluation contract
 
-**`src/ticketflow/config.py`** — add, in the existing plain `os.environ.get` module-constant style:
-
-```python
-AGENT_IMPL            = os.environ.get("TICKETFLOW_AGENT", "mock")   # mock|tunable|ollama
-OLLAMA_BASE_URL       = os.environ.get("TICKETFLOW_OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL          = os.environ.get("TICKETFLOW_OLLAMA_MODEL", "qwen3.6:35b")
-OLLAMA_FALLBACK_MODEL = os.environ.get("TICKETFLOW_OLLAMA_FALLBACK_MODEL", "qwen2.5-coder:1.5b")
-OLLAMA_JUDGE_MODEL    = os.environ.get("TICKETFLOW_OLLAMA_JUDGE_MODEL", "gemma4:26b")
-OLLAMA_TIMEOUT_S      = float(os.environ.get("TICKETFLOW_OLLAMA_TIMEOUT_S", "90"))
-OLLAMA_THINK          = os.environ.get("TICKETFLOW_OLLAMA_THINK", "0") == "1"
-```
-
-**`src/ticketflow/agent/__init__.py`** — `build_agent(role: Literal["primary","fallback"]) -> Agent`,
-dispatching on `config.AGENT_IMPL`. `worker.py:30` and `llm_worker.py:31,36` call it instead of
-constructing `MockAgent` directly.
-
-**`src/ticketflow/agent/ollama.py`** — `OllamaAgent`:
-- `httpx.AsyncClient` → `POST {base_url}/api/chat`, `stream=False`, `think=config.OLLAMA_THINK`,
-  `format=Classification.model_json_schema()`. Grammar-constrained decoding guarantees schema-valid
-  output, so even the 1.5B model can't emit malformed JSON — it just picks the wrong category, which
-  is exactly the signal we want.
-- **Sets `model="primary"` / `"fallback"`**, not the Ollama model name — preserves `model_path`
-  semantics per the constraints table. Real model names live in `RunManifest`.
-- Optional on-disk response cache keyed by `(ollama_model, role, ticket.id, think)`. The oracle and
-  rubber_stamp runs issue identical agent calls, so this **halves inference cost**, and re-runs for
-  debugging are free. Only successful responses are cached, so retry paths still exercise properly.
-  `--no-cache` for reliability-focused runs.
-- Error mapping — this is what makes the reliability metrics meaningful:
-  - connect error / timeout / 5xx / 429 → `AgentOverloadedError` (retryable, exercises the
-    workflow's hand-rolled retry at `workflows.py:216-246`)
-  - 404 model-not-found, repeated schema-validation failure → `AgentPermanentError`
-    (non-retryable → ESCALATED)
-
-**`src/ticketflow/agent/tunable.py`** — `TunableMockAgent(labels, error_rate, overconfidence,
-refund_precision, failure_rate, seed)`. Reads the expected category from an injected label map, then
-deliberately errs with probability `error_rate` and skews confidence by `overconfidence`. Per-ticket
-RNG seeded from `(seed, ticket.id)` so results are concurrency-independent.
-
-This exists **to test the harness**: wire in `error_rate=0.2` and the accuracy scorer must report
-~0.80; inject overconfidence and the calibration scorer must detect it. Without it the scorers are
-unfalsifiable.
-
-**`src/ticketflow/eval/preflight.py`** — before any ollama run: check `/api/version`, confirm the
-required models exist in `/api/tags`, then time one real `classify` + one `draft_reply`. Report
-observed latency; if p50 is within 3× of `AGENT_ACTIVITY_TIMEOUT`, monkeypatch
-`workflows.AGENT_ACTIVITY_TIMEOUT` wider and say so loudly in the manifest. Prevents slow inference
-from masquerading as model failure.
-
----
-
-## Milestone 2 — Dataset, runner, deterministic scorers
-
-**`evals/data/tickets.jsonl`**
+### Dataset types
 
 ```python
+class ExpectedOutcome(BaseModel):
+    acceptable_categories: set[TicketCategory]
+    acceptable_actions: set[ActionType]
+    expected_refund_amount: float | None = None
+    refund_tolerance: float = 0.01
+
+
 class EvalCase(BaseModel):
     id: str
     subject: str
     body: str
     customer_email: str = "eval@example.com"
-    expected_category: TicketCategory
-    expected_action: ActionType
-    expected_refund_amount: float | None = None
+    expected: ExpectedOutcome
     difficulty: Literal["easy", "ambiguous", "adversarial"]
-    source: Literal["handwritten", "generated"]   # provenance, for bias slicing
-    label_verified: bool = False                  # a human confirmed the label
+    source: Literal["handwritten", "generated"]
+    generated_by: str | None = None
+    label_verified: bool
     notes: str | None = None
 ```
 
-### Sizing — why 50 is not enough
+### Labelling rules
 
-95% CI half-widths, computed for this design:
+- Every case has at least one acceptable category and action.
+- Ambiguous cases may have multiple acceptable outcomes.
+- A refund is expected only when the ticket explicitly requests one for a duplicate or incorrect
+  charge and states the amount.
+- The expected refund amount must appear in the ticket text and match within
+  `refund_tolerance`.
+- Committed cases have `label_verified=true`.
+- Generated cases record `generated_by`, remain separately sliced in reports, and require human
+  verification.
+- `evals/data/labeling.md` documents the policy and includes positive, negative, ambiguous, and
+  adversarial examples.
 
-| Metric | N=50 | N=200 |
-|---|---|---|
-| Overall accuracy | **±11 pts** | ±5.5 pts |
-| `unreviewed_error_rate` (~12%) | **±9 pts** (~6 events) | ±4.5 pts (~24 events) |
-| Adversarial tier | **±28 pts** (10 cases) | ±13 pts |
-| Per-class recall (4 classes) | **±23 pts** | ±11 pts |
+The loader rejects:
 
-At N=50 the headline metric's interval is roughly [3%, 21%] — spanning "fine" to "one customer in
-five gets a bad answer." Not decision-grade. And if the model is *good* (95% accuracy), the metric
-rests on **2 events out of 50**.
+- Duplicate IDs.
+- Empty acceptable category or action sets.
+- Unverified labels.
+- Refund labels without an amount.
+- Refund amounts that do not appear in the ticket.
+- Generated cases without generator provenance.
+- Dataset tier or category balance outside configured tolerance.
 
-**Repeats do not fix this.** 50 cases × 3 repeats is *not* N=150 — the three observations of a case
-are clustered by that case's difficulty. Repeats measure model **self-consistency**, a different
-(also useful) quantity. They cannot buy precision on accuracy. Accordingly: `--repeats` defaults to
-**1**; `--repeats 3` runs on a ~30-case subset and is reported separately as a self-consistency
-rate, **never folded into accuracy**.
+### Initial dataset
 
-**Compute is not the constraint** — qwen is MoE with short schema-constrained outputs (~6-8s/case),
-so 200 cases is ~25 min per agent pass, and the response cache lets both reviewer policies share it.
-A full run with judging is ≈1 hour. The constraint is *labelling effort*.
+Milestone 1 ships approximately 50 verified handwritten cases:
 
-### Target: N≈200, staged
+- 20 easy cases.
+- 20 ambiguous cases.
+- 10 adversarial cases.
 
-- **M2 ships ~50 hand-written cases** — enough to prove the harness works; never blocked on labelling.
-- **M3 grows to ~200**, re-stratified: **60 easy / 80 ambiguous / 60 adversarial**. (The original
-  20/20/10 had it backwards — the adversarial tier is the most informative and deserves the most
-  cases, not the fewest.)
+Milestone 4 grows the dataset toward approximately 200 verified cases:
 
-Tiers:
-- **easy** — keyword-clean, resolvable by `KEYWORD_CATEGORIES` (`mock.py:17`). Baseline sanity;
-  `MockAgent` should near-ace these, proving the harness isn't broken. Seed from
-  `scripts/batch.py:22 KEYWORD_TEMPLATES`.
-- **ambiguous** — multi-intent ("charged twice after the app crashed during checkout").
-- **adversarial** — keyword traps ("no crash at all, I just need my invoice" → BILLING despite
-  containing "crash"). `MockAgent` fails these *by construction*, proving the harness measures
-  something real rather than echoing the mock.
+- 60 easy cases.
+- 80 ambiguous cases.
+- 60 adversarial cases.
 
-### Growing the dataset (M3)
-
-Generate variants **with Claude, never with qwen or gemma** — a model must not be evaluated on data
-authored by itself or its judge. Then a human verifies every label and sets `label_verified=true`.
-
-Two safeguards against the known optimism risk:
-1. **Every metric is sliced by `source`.** If generated cases score materially higher than
-   hand-written ones, the stereotyping bias is *visible in the report* rather than silently inflating
-   the headline number.
-2. **Track label churn during verification.** If a human corrects more than ~10% of generated
-   labels, the generation prompt is bad and the batch is discarded, not patched.
-
-`dataset.py` validates on load: unique ids, tier and per-class balance within tolerance, all
-`label_verified`, refund cases carry `expected_refund_amount`. Wire it to `make eval-dataset-check`.
-
-### Runner
-
-**`src/ticketflow/eval/runner.py`** — per case, per repeat:
-1. `handle = await client.start_workflow(TicketWorkflow.run, ticket, id=f"eval-{run_id}-{case.id}-{rep}", task_queue=queue)`
-2. Poll `handle.query(TicketWorkflow.status)` — **capture `info.classification` and `info.draft` here**;
-   they are unavailable after termination.
-3. If `AWAITING_APPROVAL` → reviewer policy decides → `handle.execute_update(TicketWorkflow.submit_approval, ApprovalDecision(...))`
-4. `await handle.result()` → `TicketResult`
-5. Query the read model's `refunds` / `refund_attempts` tables (`readmodel.py:21,25`) for side-effect checks
-6. Emit `CaseRecord`
-
-Default `--concurrency 2` for ollama profiles: Ollama serializes past `OLLAMA_NUM_PARALLEL`, and
-queued requests burn the activity's start-to-close budget. Mock profiles can run wide.
-
-**`reviewers.py`** — two policies, both run so the gap between them is measurable:
-- `oracle` — approve iff the draft is actually correct per the label
-- `rubber_stamp` — always approve
-
-**`records.py`** — `CaseRecord`: run_id, case_id, repeat, ticket_id, predicted_category,
-classification_confidence, predicted_action, predicted_refund_amount, draft_confidence, reply_text,
-model_path, terminal_status, refund_executed, was_gated, approval_granted, refund_rows,
-refund_attempt_rows, latency_ms, error, judge_scores (filled in phase 2). `RunManifest`: run_id,
-timestamp, agent impl + **real Ollama model names**, think flag, reviewer policy, dataset path +
-sha256, repeats, seed, cache on/off, and a snapshot of the workflow constants
-(`CONFIDENCE_THRESHOLD`, timeouts, including any preflight widening) so a run stays interpretable
-months later.
-
-### Scorers
-
-**`scorers/deterministic.py`**:
-- *Quality*: category accuracy, per-class P/R/F1, confusion matrix; action accuracy; refund-amount error
-- *Harm* — **the headline metric**: `unreviewed_error_rate` = P(RESOLVED ∧ ¬gated ∧ category wrong).
-  A wrong reply reached a customer with no human in the loop.
-- *Cost*: `review_load` = P(gated). These two trade off, and that tradeoff is the eval.
-- *Value of the gate*: under `oracle`, P(gated ∧ wrong ∧ rejected) — errors the human actually caught.
-  The `oracle` − `rubber_stamp` delta prices the human-in-the-loop.
-- *System invariants* (harness/workflow bugs, not model quality — any hit is a defect):
-  - `was_gated == (action == REFUND or draft.confidence < 0.75)`
-  - `refund_rows <= 1` per ticket and `refund_attempt_rows >= refund_rows` (idempotency,
-    same check as `test_activities.py:40`)
-  - `refund_executed` implies an approved decision
-- *Reliability*: escalation rate, `model_path` histogram (fallback usage), retry counts
-- *Quality × degradation*: every quality metric sliced by `model_path` — this is where the
-  qwen-vs-1.5b gap becomes a number, closing the loop on `docs/context.md:92-101`
-
-**`scorers/calibration.py`** — 10-bin reliability curve, ECE, Brier score, and the **threshold sweep**:
-for t in 0.0…1.0 step 0.05, recompute (review_load, unreviewed_error_rate) offline from the stored
-records. This is what turns the harness into a decision tool — `CONFIDENCE_THRESHOLD` becomes a
-tuned number instead of a guess.
-
-**`statistics.py`** — the piece that keeps the numbers honest:
-- **Bootstrap CIs clustered by case** (resample *cases*, not observations) on every reported metric,
-  so repeats can never masquerade as sample size. No point estimate is ever printed without its
-  interval.
-- **Paired run-vs-run testing** — McNemar for accuracy-type metrics, paired bootstrap for rates.
-  Because two runs share the same cases, pairing cancels case difficulty and detects far smaller
-  deltas than the unpaired intervals above. **This is what makes regression detection usable well
-  below N=200**, and it is cheap to implement.
-- Self-consistency rate from `--repeats` runs, reported as its own metric.
-
-**`report.py` / `compare.py`** — write `records.jsonl` + `manifest.json` + `report.md`; print a
-console summary with CIs and per-`source` slices; diff a run against a baseline run_id using the
-paired tests and flag regressions that are *statistically* distinguishable, not merely numerically
-different.
+Repeats do not increase the effective number of labelled cases. `--repeats` defaults to 1.
+Repeated runs measure self-consistency and are clustered by case in all uncertainty calculations.
 
 ---
 
-## Milestone 3 — LLM judge (phase 2)
+## Correctness definitions
 
-**`scorers/judge.py`** — runs **offline over `records.jsonl`**, after the agent models are unloaded.
-Uses `gemma4:26b`, a different family from the agent (a model grading itself is worthless). Thinking
-may be enabled here since there's no activity timeout to trip. Rubric, three dimensions returned as
-a structured `JudgeVerdict` via the same JSON-schema mechanism:
-1. **Relevance** — does the reply address *this* ticket? (1-5)
-2. **Tone** — appropriate for support? (1-5)
-3. **No hallucinated commitments** — invented refund amounts, dates, or promises? (bool; the
-   safety-relevant one)
+Each case record derives:
 
-**Judge validation is not optional.** `evals/data/judge_calibration.jsonl` holds ~12 hand-scored
-replies (deliberately spanning good / mediocre / hallucinating). Every `--judge` run first scores
-those and reports agreement (exact-match % and Cohen's κ) in the report header. A judge score
-without its agreement number is not reportable.
+```text
+category_correct =
+    predicted_category in acceptable_categories
 
----
+action_correct =
+    predicted_action in acceptable_actions
 
-## Testing the harness
+refund_correct =
+    predicted_action is not REFUND
+    or (
+        an expected amount exists
+        and a predicted amount exists
+        and abs(predicted_amount - expected_amount) <= refund_tolerance
+    )
 
-New `tests/test_eval_*.py`, mock-only, no network, run by default in `make test`:
-- `TunableMockAgent(error_rate=0.2, seed=…)` → accuracy scorer reports ~0.80 within tolerance
-- Calibrated agent → ECE ≈ 0; `overconfidence=0.3` → ECE above threshold. **Falsifies the calibration scorer.**
-- Policy-invariant checker flags a deliberately-mismatched record
-- Idempotency checker catches a synthetic double-refund
-- Reviewer policies decide correctly on constructed records
-- `OllamaAgent` error mapping tested against a stubbed `httpx` transport (no server)
-- Real Ollama runs live behind a new `eval` marker, default-deselected — following the existing
-  `smoke` precedent (`pyproject.toml:39-42`, opted in with `-o addopts=`)
+structured_correct =
+    category_correct and action_correct and refund_correct
+```
 
-**`pyproject.toml`**: move `httpx` from dev to runtime deps; register the `eval` marker.
-**`Makefile`**: `eval` (tunable mock, fast, no network), `eval-ollama`, `eval-compare`.
-**`.gitignore`**: `evals/runs/`, `evals/cache/`.
+The deterministic headline metrics are:
 
----
+- `unreviewed_structured_error_rate`: proportion of all cases that resolved without gating and
+  had an incorrect structured outcome.
+- `unreviewed_category_error_rate`.
+- `unreviewed_action_error_rate`.
+- `review_load`: proportion of cases gated for approval.
+- `gate_catch_rate`: proportion gated, structurally incorrect, and rejected by the oracle.
+- Category precision, recall, F1, and confusion matrix.
+- Action accuracy and refund-amount error.
+- Escalation rate and fallback usage.
 
-## Risks
-
-1. **Activity timeout vs. real inference latency (highest).** `AGENT_ACTIVITY_TIMEOUT = 2 min`
-   (`workflows.py:33`) is a hard cap; a thinking model that exceeds it retries and escalates,
-   turning slow inference into fake model failures across every reliability metric.
-   **Mitigation:** `think=false` for agents, the preflight latency probe, and explicit timeout
-   widening recorded in the manifest.
-2. **Time-skipping vs. real latency.** `start_time_skipping()` may advance the clock past
-   `AGENT_SCHEDULE_TO_START_S=30` while an Ollama call is in flight, producing phantom fallbacks.
-   **Mitigation:** mock profiles use `start_time_skipping()`; the ollama profile uses
-   `WorkflowEnvironment.start_local()` (real clock). The harness approves within seconds, so the 24h
-   timer never matters there. *Verify the exact time-skipping-control API against the installed
-   `temporalio` version before relying on it.*
-3. **Throughput.** 50 cases × 2 reviewer policies × 2 agent calls = 200 qwen calls per run. The
-   response cache cuts this to ~100 (reviewer policies share agent calls). Default repeats to 1 for
-   ollama; provide `--limit` for smoke runs.
-4. **Judge noise** — mitigated by the mandatory agreement check; if κ is low, report deterministic
-   metrics only.
-5. **Coder model as fallback stand-in** — accepted, documented above; the qwen-vs-gemma comparison
-   via `compare.py` is the cleaner study when wanted.
-6. **Under-powered metrics read as fact.** The most likely way this harness misleads is someone
-   quoting "87% accuracy" from a 50-case run as if it meant something. **Mitigation:** no point
-   estimate is ever rendered without its CI, and `report.md` states the N and tier sizes in its
-   header.
-7. **Generated-data optimism** — Claude-authored tickets are cleaner and more stereotyped than real
-   support traffic, so absolute scores will run optimistic. **Mitigation:** the per-`source` slice
-   makes the gap visible; the hand-written adversarial tier remains the honest signal.
+Reply relevance, tone, or hallucination are never inferred from category correctness. They are
+reported separately by the validated offline judge.
 
 ---
 
-## Verification
+## Run profiles
 
-1. `make check` — format, lint (docstrings!), pyright, tests all green.
-2. `make test` — the 16 existing `test_workflow.py` tests still pass after `make_worker` moves out of
-   `tests/helpers.py`. This is the main regression risk of the refactor.
-3. `uv run python scripts/eval.py --agent tunable --error-rate 0.2 --seed 42` → accuracy ≈ 0.80.
-   **The harness measuring a known-wrong agent correctly is the core proof it works.**
-4. `--agent mock` → near-perfect on the `easy` tier, poor on `adversarial`. Confirms the dataset
-   discriminates rather than echoing the mock's keyword table.
-5. `uv run python scripts/eval.py --agent ollama --limit 5` — a smoke run confirming preflight,
-   structured output, and observed latency well under the activity timeout.
-6. Full run: `uv run python scripts/eval.py --agent ollama --reviewer both --judge` → `report.md`.
-   Watch `/api/ps` during the run to confirm gemma and qwen are **never resident together**.
-7. Read the threshold sweep in that report and check whether 0.75 is defensible. If the curve says
-   otherwise, that finding *is* the deliverable.
-8. Check the `model_path` slice: qwen-primary vs 1.5b-fallback quality gap. That number is the
-   answer to "is degraded service actually acceptable?"
-9. `scripts/eval.py --baseline <run_id>` against a re-run → near-zero deltas for the seeded mock,
-   and the paired test reports *no significant change*.
-10. Statistics sanity: a synthetic pair of runs differing by a known 5-point margin is flagged by the
-    paired test but **not** by the unpaired CIs at N=50 — demonstrating the pairing is doing real work.
-11. Every metric in `report.md` carries a CI, and no CI is so wide as to be uninterpretable at the
-    dataset size actually used.
+### Primary quality
+
+`primary-quality` runs the dataset through the real workflow with the primary task queue backed by
+the primary model. Agent outputs use `model="primary"`.
+
+### Fallback quality
+
+`fallback-quality` backs the same agent task queue directly with the fallback model. Agent outputs
+use `model="fallback"`.
+
+This deliberately bypasses the schedule-to-start routing delay. It measures fallback-model quality,
+not whether fallback routing works. Primary and fallback quality runs are paired by case.
+
+### Fallback routing
+
+`fallback-routing` is a separate operational profile:
+
+- A worker is hosted on the fallback queue.
+- The primary worker is withheld or deliberately saturated.
+- The workflow must reach fallback through the real primary schedule-to-start timeout.
+- The configured timeout and routing reason are recorded.
+- Results are excluded from primary-versus-fallback model-quality headlines.
+
+### Reliability
+
+`reliability` uses the selected agent with:
+
+- Oracle reviewer only.
+- Cache disabled.
+- Call and retry telemetry enabled.
+- Real failures, attempts, and latencies included in the report.
+
+### Reviewer policies
+
+Quality runs execute policies in this order:
+
+1. `oracle`: approve only when the structured outcome is correct.
+2. `rubber_stamp`: approve every gated draft.
+
+Only successful agent responses are cached. The second policy therefore receives byte-identical
+agent outputs. Cache-hit policy runs are excluded from model-latency and reliability statistics.
 
 ---
 
-## Suggested order
+## Workflow runner
 
-M1 (agent seam + tunable mock + ollama agent + preflight) → M2 (~50-case dataset + runner +
-deterministic scorers + statistics + report) → M3 (grow dataset to ~200 + judge + calibration sweep +
-paired compare).
+For each case and repeat:
 
-Each milestone is independently useful. M2 already answers the unreviewed-error-rate question — but
-only with ±9-point error bars, so treat its output as directional until M3 lands the larger dataset.
+1. Assign a unique workflow and ticket ID containing the run, policy, case, and repeat.
+2. Start `TicketWorkflow` on a run-specific task queue.
+3. Poll until the workflow either reaches `AWAITING_APPROVAL` or terminates.
+4. If approval is required, calculate and submit the selected reviewer decision.
+5. Await the terminal `TicketResult`.
+6. Query `TicketWorkflow.status` after completion to capture classification, draft, and decision.
+7. Query refund and refund-attempt rows for the ticket.
+8. Emit one `CaseRecord` plus its `CallEvent` entries.
+
+The harness moves reusable worker construction out of `tests/helpers.py` into production eval code.
+`tests/helpers.py` re-exports the helper so existing workflow tests remain unchanged.
+
+The harness supports:
+
+- Separate primary and fallback agents.
+- Separate workflow, primary, and fallback queues.
+- Time-skipping Temporal for mock-only tests.
+- Local real-time Temporal for Ollama runs.
+- A run-specific SQLite read model.
+- Configurable concurrency, defaulting to 2 for Ollama.
 
 ---
 
-## Open questions to resolve early
+## Agent construction
 
-1. **Does the local model's `confidence` carry any signal?** If qwen emits a near-constant 0.9, the
-   calibration work still yields a correct and useful answer — "the gate is theatre" — but the
-   threshold sweep degenerates to a flat line rather than a tuning tool. Probe with ~10 cases before
-   building the sweep.
-2. **The `temporalio` time-skipping-control API is unverified** (no venv was installed when this plan
-   was written). Check it against the installed version before the ollama profile depends on it.
-3. **Judge agreement κ may come back too low to report**, in which case M3 degrades to deterministic
-   metrics only.
+### Production seam
+
+Production configuration supports `mock` and `ollama`. The LLM worker uses a small factory for
+primary and fallback roles.
+
+The general workflow worker continues to avoid constructing an Ollama client because its
+registered side-effect activities never call the agent.
+
+Evaluation code constructs tunable, primary, and fallback agents explicitly from the dataset and
+run configuration. The production factory is not responsible for label-aware tunable agents.
+
+### Tunable mock
+
+`TunableMockAgent` derives each decision from a stable hash of:
+
+```text
+(seed, ticket.id, operation)
+```
+
+Its profile controls:
+
+- Category error rate or exact error IDs.
+- Action error rate or exact error IDs.
+- Refund-amount error rate or exact error IDs.
+- Confidence calibration and overconfidence.
+- Transient failure rate or exact failure IDs.
+- Primary or fallback role label.
+
+This makes output independent of concurrency and execution order. Exact error IDs are used in unit
+tests so expected metrics are not probabilistic.
+
+### Ollama agent
+
+Use a shared, lifecycle-managed `httpx.AsyncClient` and `POST /api/chat` with:
+
+- `stream=false`.
+- `think=false` for workflow agent calls.
+- `temperature=0`.
+- Configurable seed and timeout.
+- A distinct output schema for classification and drafting.
+- The JSON schema supplied through `format` and included in the grounding prompt.
+
+Output-only response models omit the internal `model` field. After Pydantic validation, application
+code assigns `model="primary"` or `model="fallback"`.
+
+Error mapping:
+
+- Connection errors, HTTP timeouts, 408, 429, and 5xx become `AgentOverloadedError`.
+- 400, 404/model-not-found, and schema-validation errors become `AgentPermanentError`.
+- Failures are recorded in telemetry and never cached.
+
+Agent activities send heartbeats at least every 10 seconds while waiting for Ollama. This prevents
+valid calls from tripping the current 30-second heartbeat timeout.
+
+---
+
+## Telemetry
+
+Each classification or drafting attempt emits:
+
+```python
+class CallEvent(BaseModel):
+    run_id: str
+    case_id: str
+    policy: str
+    operation: Literal["classify", "draft"]
+    role: Literal["primary", "fallback"]
+    attempt: int
+    cache_hit: bool
+    started_at: datetime
+    wall_latency_ms: float
+    model_total_duration_ms: float | None
+    model_load_duration_ms: float | None
+    outcome: Literal["success", "transient_error", "permanent_error"]
+    error_type: str | None
+```
+
+Reports distinguish:
+
+- End-to-end case latency.
+- Agent wall-clock latency.
+- Ollama load and generation duration.
+- Workflow queue and retry delay.
+- Primary and fallback attempts.
+- Cache hits.
+
+`model_path` alone is not used as a retry counter.
+
+---
+
+## Response cache
+
+Only successful agent responses are cached. The cache key hashes the complete normalized request:
+
+- Operation (`classify` or `draft`).
+- Model name and digest.
+- Role.
+- Ticket content.
+- Classification input for drafting.
+- Messages and prompt version.
+- JSON schema.
+- Think setting.
+- Temperature, seed, and generation options.
+- Ollama version.
+
+Entries include request metadata for inspection and are written atomically. Any change to the
+operation, input, model, prompt, schema, or generation configuration invalidates the entry.
+
+`--no-cache` is mandatory for reliability runs.
+
+---
+
+## Run artifacts and reproducibility
+
+`CaseRecord` contains:
+
+- Run, policy, case, repeat, and ticket IDs.
+- Difficulty, source, and accepted labels.
+- Predicted category, action, refund amount, and confidences.
+- Reply text and role-based model path.
+- Terminal status, gating, and approval decision.
+- Refund and refund-attempt counts.
+- End-to-end latency and terminal error.
+
+`RunManifest` records:
+
+- Git commit and dirty state.
+- Dataset path and SHA-256.
+- Agent implementation and run profile.
+- Real model names and digests.
+- Ollama, Python, and relevant dependency versions.
+- Prompt, schema, and rubric hashes.
+- Generation options.
+- Reviewer policies and order.
+- Cache setting.
+- Workflow thresholds and timeouts.
+- Preflight measurements and timeout adjustments.
+- Seed, concurrency, repeats, and timestamps.
+
+Raw artifacts are immutable. Reports and judgments always point back to their source record and
+manifest hashes.
+
+---
+
+## Ollama preflight
+
+Before a real-model run:
+
+1. Check `/api/version`.
+2. Confirm all required models exist and record their digests.
+3. Run one unmeasured warm-up.
+4. Measure at least three representative classifications and three drafts.
+5. Separate model-load time from generation time.
+6. Set the effective activity timeout to the larger of the configured value or three times the
+   slowest observed stage.
+7. Set the HTTP timeout below the activity timeout with a safety margin.
+8. Record measurements and every timeout adjustment in the manifest.
+9. Probe approximately ten cases for confidence variance.
+
+If draft-confidence standard deviation is below 0.02, the report states that threshold tuning is
+unsupported by the model and suppresses the threshold sweep. A flat confidence distribution is a
+valid finding, not a harness failure.
+
+---
+
+## Statistics
+
+### Confidence intervals
+
+- Use case-clustered percentile bootstrap intervals.
+- Resample cases while retaining all repeats for each selected case.
+- Use 5,000 samples, a fixed manifest seed, and 95% intervals.
+- Attach intervals to rates and derived scores.
+- Raw counts, configuration values, and confusion-matrix cells do not require intervals.
+- Report self-consistency separately from accuracy.
+
+### Paired comparisons
+
+For runs over identical case IDs:
+
+- Report paired effect sizes and bootstrap intervals.
+- Use exact McNemar tests only for binary correctness as supporting evidence.
+- Flag a headline regression only when its paired 95% interval excludes zero and the absolute
+  degradation is at least five percentage points.
+- Treat per-class, difficulty, and source slices as exploratory.
+- Do not claim that N=50 reliably detects a five-point change.
+
+### Threshold sweep
+
+For thresholds from 0.00 through 1.00 in 0.05 increments:
+
+```text
+gated =
+    predicted_action == REFUND
+    or draft_confidence < threshold
+
+review_load =
+    P(gated)
+
+unreviewed_structured_error_rate =
+    P(not gated and not structured_correct)
+```
+
+The sweep is computed from stored outputs without rerunning models and is rendered only when
+confidence variance passes preflight.
+
+---
+
+## Reporting
+
+Each report includes:
+
+- Dataset size, source, difficulty, and category composition.
+- Directional-only labelling for approximately 50-case runs.
+- Structured quality metrics and confidence intervals.
+- Primary-versus-fallback paired comparisons.
+- Oracle-versus-rubber-stamp outcomes.
+- Review-load versus unreviewed-error threshold table.
+- Reliability metrics with cache-hit exclusions.
+- Difficulty and source slices.
+- Confidence-distribution diagnostics.
+- System-invariant violations.
+- Judge validation results beside every judge-derived metric.
+
+System invariants include:
+
+- `was_gated` agrees with the recorded workflow threshold and refund rule.
+- At most one refund row exists per ticket.
+- Refund attempts are greater than or equal to executed refunds.
+- An executed refund implies an approved decision.
+- A fallback-routing record identifies the fallback path.
+
+---
+
+## Offline LLM judge
+
+The judge scores stored reply text on:
+
+1. Relevance to the ticket, 1–5.
+2. Appropriate support tone, 1–5.
+3. Hallucinated commitments, boolean.
+
+Judge calibration uses at least 30 replies spanning good, weak, irrelevant, and hallucinated
+outputs. Two humans score them independently and adjudicate disagreements.
+
+Validation gates:
+
+- Weighted Cohen's κ of at least 0.60 for relevance.
+- Weighted Cohen's κ of at least 0.60 for tone.
+- Cohen's κ of at least 0.60 and F1 of at least 0.80 for hallucination.
+- Agreement intervals and calibration sample size appear in the report.
+- A failing dimension is suppressed without suppressing dimensions that passed.
+
+Judge-derived response-issue rates remain secondary to deterministic structured metrics. Using a
+different model family reduces obvious self-grading bias but does not make the judge independent or
+ground truth.
+
+---
+
+## CLI
+
+`scripts/eval.py` provides:
+
+```text
+dataset-check
+run --profile primary-quality|fallback-quality|fallback-routing|reliability
+judge --run-id <id>
+report --run-id <id>
+compare --baseline <id> --candidate <id>
+```
+
+Important options:
+
+- `--agent tunable|mock|ollama`
+- `--reviewer oracle|rubber_stamp|both`
+- `--limit N`
+- `--repeats N`
+- `--concurrency N`
+- `--seed N`
+- `--no-cache`
+- Model and Ollama endpoint overrides
+
+Make targets:
+
+- `eval-dataset-check`
+- `eval` for the fast tunable profile
+- `eval-ollama`
+- `eval-compare`
+
+Networked tests use an `ollama` marker and remain deselected by default.
+
+---
+
+## Implementation milestones
+
+### Milestone 1 — Evaluation contract and deterministic core
+
+Deliver:
+
+- Labelling guide and approximately 50 verified cases.
+- Dataset models and validation.
+- Immutable record models.
+- Deterministic structured scorers.
+- Clustered confidence intervals.
+- Basic Markdown and console reports.
+- Exact synthetic tests.
+
+Acceptance:
+
+- Constructed records with known outcomes produce exact expected metrics.
+- Invalid and unverified datasets fail with actionable errors.
+- No Temporal or Ollama process is required.
+
+### Milestone 2 — Workflow harness and tunable agents
+
+Deliver:
+
+- Reusable in-process Temporal harness.
+- Post-completion state capture.
+- Oracle and rubber-stamp reviewers.
+- Primary-quality, fallback-quality, fallback-routing, and reliability profiles.
+- Stable tunable agent.
+- Attempt telemetry and refund-invariant checks.
+
+Acceptance:
+
+- A configured exact error set produces the exact expected workflow-level error rates.
+- Output is independent of concurrency and case order.
+- Forced fallback quality is distinct from real fallback routing.
+- Existing workflow tests remain unchanged and green.
+
+### Milestone 3 — Ollama integration
+
+Deliver:
+
+- Lifecycle-managed Ollama agent.
+- Operation-specific prompts and schemas.
+- Periodic activity heartbeats.
+- Complete cache keys and atomic entries.
+- Preflight probes and timeout adjustment.
+- Immutable run artifacts and manifest metadata.
+- Stubbed HTTP tests plus a limited local smoke run.
+
+Acceptance:
+
+- Primary and fallback quality profiles run over the same limited case set.
+- Policy runs receive byte-identical cached outputs.
+- HTTP, validation, and timeout failures map to the expected agent error classes.
+- Qwen and Gemma are not resident simultaneously.
+
+### Milestone 4 — Decision-grade evaluation
+
+Deliver:
+
+- Dataset growth toward 200 verified cases.
+- Paired comparison reports.
+- Threshold sweep and confidence diagnostics.
+- Judge calibration and versioned judgment artifacts.
+- Final source/difficulty slices.
+
+Acceptance:
+
+- The report can support or reject the current 0.75 threshold while displaying uncertainty.
+- The primary-versus-fallback comparison reports a paired degradation estimate.
+- No judge dimension appears unless its validation gate passes.
+
+---
+
+## Test plan
+
+- Dataset validation rejects duplicate IDs, empty labels, unverified labels, inconsistent refunds,
+  and missing generated provenance.
+- Structured scorer tests use synthetic records with exact expected rates.
+- Bootstrap tests prove repeats remain clustered by case.
+- Comparison tests cover unchanged runs, meaningful regressions, and underpowered changes that must
+  not be flagged.
+- Tunable-agent tests prove concurrency-independent output and exact injected failures.
+- Workflow tests cover ungated resolution, oracle rejection, rubber-stamp approval, forced fallback
+  quality, real fallback routing, retry telemetry, and refund idempotency.
+- Cache tests prove invalidation on operation, ticket text, classification, prompt, schema, model
+  digest, and generation options.
+- Ollama HTTP tests use a stub transport for success, malformed output, timeout, 400, 404, 408, 429,
+  and 5xx behavior.
+- Heartbeat tests prove long agent calls cannot hit the 30-second heartbeat timeout.
+- Judge tests cover per-dimension calibration gates and versioned output.
+- A complete `make check` remains the final repository regression gate.
+
+---
+
+## Principal risks and mitigations
+
+1. **Slow inference looks like failure.** Mitigate with periodic heartbeats, measured preflight, and
+   recorded timeout widening.
+2. **Fallback quality is confused with routing behavior.** Keep direct fallback-quality and
+   schedule-to-start routing profiles separate.
+3. **A stale cache corrupts paired comparisons.** Hash the complete request and model identity.
+4. **Category error is presented as reply error.** Keep structured and judged reply metrics
+   separate.
+5. **Small samples are over-interpreted.** Always report intervals and mark N≈50 runs directional.
+6. **Confidence is constant or meaningless.** Diagnose variance and suppress unsupported sweeps.
+7. **Generated data is easier than real traffic.** Require human verification and report by source.
+8. **Judge scores appear authoritative.** Gate each dimension on human agreement and show the
+   calibration result.
+
+---
+
+## Completion criteria
+
+The harness is complete when:
+
+- `make check` passes with all existing and new network-free tests.
+- The tunable profile reproduces exact injected structured-error rates.
+- Limited primary and fallback Ollama runs produce immutable, reproducible artifacts.
+- Fallback model quality and fallback routing are reported as different experiments.
+- Every inferential headline rate includes a 95% interval.
+- The threshold report either presents a defensible tradeoff curve or explicitly explains why the
+  model's confidence cannot support threshold tuning.
+- Judge-derived metrics appear only for validated dimensions.
