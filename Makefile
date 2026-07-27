@@ -1,4 +1,4 @@
-.PHONY: install install-hooks lint format-check format typecheck check test test-eval coverage smoke test-docker test-docker-tracing server server-docker up down logs stack-reset jaeger search-attributes worker llm-worker api doctor ticket status approve reject batch reset
+.PHONY: install install-hooks lint format-check format typecheck check test test-eval test-eval-ollama eval-ollama coverage smoke test-docker test-docker-tracing server server-docker up down logs stack-reset jaeger search-attributes worker llm-worker api doctor ticket status approve reject batch reset
 
 N ?= 100
 API_URL ?= http://localhost:8000
@@ -40,6 +40,12 @@ test:
 
 test-eval:
 	uv run pytest -m eval -o addopts=
+
+test-eval-ollama:
+	uv run pytest -m ollama -o addopts=
+
+eval-ollama:
+	uv run python scripts/eval_ollama.py
 
 coverage:
 	uv run pytest --cov=ticketflow --cov-report=term-missing
