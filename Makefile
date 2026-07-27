@@ -7,10 +7,17 @@ TEMPORAL_NAMESPACE ?= default
 
 install:
 	uv sync --all-groups
-	uv run pre-commit install --hook-type pre-push
+	$(MAKE) install-hooks
 
 install-hooks:
-	uv run pre-commit install --hook-type pre-push
+	@hook_path="$$(git rev-parse --git-path hooks/pre-push)"; \
+	printf '%s\n' \
+		'#!/usr/bin/env bash' \
+		'set -euo pipefail' \
+		'HOOK_DIR="$$(cd "$$(dirname "$$0")" && pwd)"' \
+		'exec uv run pre-commit hook-impl --config=.pre-commit-config.yaml --hook-type=pre-push --hook-dir "$$HOOK_DIR" -- "$$@"' \
+		> "$$hook_path"; \
+	chmod +x "$$hook_path"
 
 lint:
 	uv run ruff check .
