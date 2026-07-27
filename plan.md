@@ -32,6 +32,10 @@ decision-grade.
 - Changing Temporal-crossing ticket, workflow, or result models.
 - Treating category correctness as proof that a customer-facing reply is correct.
 
+**One production change is in scope:** agent activities gain a periodic heartbeat loop. This is
+required before any real model can be called at all, and it is already recorded as an accepted
+follow-up in the decision log rather than being new scope introduced here.
+
 ---
 
 ## Verified local environment and model roles
@@ -65,7 +69,11 @@ Its absolute score is not assumed to transfer to another fallback model.
 | The current test helper hosts only one agent queue. | The harness must support independently injected primary and fallback agents and queues. |
 | `MockAgent` uses one mutable RNG. | The tunable eval agent must derive randomness from stable per-ticket hashes. |
 | `model_path` depends on literal `primary` and `fallback` labels. | Real model names belong in the manifest; agent outputs retain role labels. |
-| Source modules require docstrings and line length 88. | All new modules and public APIs follow existing Ruff rules. |
+| Approval is a workflow **update** with a validator, not a signal. | The runner submits decisions through `execute_update` and handles rejected updates as case outcomes. |
+| `ProposedAction` rejects a refund without a positive amount. | Malformed refunds are validation failures, not quality signals, and need a repair budget before escalating. |
+| Every status transition upserts the `TicketStatus` search attribute. | The harness environment must register the key or every workflow task fails. |
+| The fallback activity has no schedule-to-start timeout. | The runner needs its own per-case deadline so a missing fallback worker cannot hang a run. |
+| Source modules and scripts require docstrings and line length 88. | All new modules, public APIs, and `scripts/eval.py` follow existing Ruff rules. |
 
 ---
 
@@ -90,27 +98,29 @@ src/ticketflow/
     tunable.py
     ollama.py
   eval/
-    dataset.py
-    records.py
-    harness.py
-    runner.py
-    reviewers.py
-    telemetry.py
-    cache.py
-    preflight.py
-    statistics.py
-    compare.py
-    report.py
+    dataset.py        # milestone 1
+    records.py        # milestone 1
+    statistics.py     # milestone 1: intervals, paired comparison, threshold sweep
+    report.py         # milestone 1
+    harness.py        # milestone 2: Temporal environment and worker construction
+    runner.py         # milestone 2: per-case execution
+    reviewers.py      # milestone 2
     scorers/
-      deterministic.py
-      calibration.py
-      judge.py
+      deterministic.py  # milestone 1
+      calibration.py    # milestone 4
+      judge.py          # milestone 4
 
 scripts/eval.py
 ```
 
+Telemetry, response caching, and preflight probing live inside `agent/ollama.py`, which is the
+only module that knows about model calls; they are split out only if a second real agent appears.
+Paired comparison lives in `statistics.py` for the same reason. The directory grows per milestone
+rather than being created empty up front.
+
 `records.jsonl` and `calls.jsonl` are immutable raw artifacts. Re-running the judge creates a new
-file under `judgments/`; it never rewrites raw workflow output.
+file under `judgments/`; it never rewrites raw workflow output. `evals/runs/` and `evals/cache/`
+are added to `.gitignore`; only `evals/data/` is committed.
 
 ---
 
@@ -180,11 +190,33 @@ Milestone 4 grows the dataset toward approximately 200 verified cases:
 Repeats do not increase the effective number of labelled cases. `--repeats` defaults to 1.
 Repeated runs measure self-consistency and are clustered by case in all uncertainty calculations.
 
+`--repeats > 1` implies `--no-cache` and a varied or absent seed, and the CLI enforces this. With
+the cache on, every repeat after the first is a cache hit by construction; at `temperature=0` with
+a fixed seed, repeats measure the decoder's determinism rather than the model's self-consistency.
+Either way the measurement would be vacuous.
+
 ---
 
 ## Correctness definitions
 
-Each case record derives:
+### Scored population
+
+A case is **scored** only if it produced a draft. Cases that escalated because the agent failed,
+exhausted retries, or never returned a valid structured output have no prediction and are not
+scorable.
+
+This matters because escalation is not silent: the workflow still sends `ESCALATION_REPLY` and
+never gates it. Folding escalations into a structured-quality headline would count an availability
+failure as a classification error. Therefore:
+
+- All structured-quality rates use the scored population as their denominator, and every reported
+  rate names its denominator explicitly.
+- `escalation_rate` and `invalid_output_rate` are reported beside them over **all** cases, never
+  folded in.
+- A single combined `unhelpful_outcome_rate` over all cases may be reported as a customer-facing
+  summary, clearly labelled as combining quality and availability.
+
+Each scored case record derives:
 
 ```text
 category_correct =
@@ -205,17 +237,26 @@ structured_correct =
     category_correct and action_correct and refund_correct
 ```
 
-The deterministic headline metrics are:
+The deterministic headline metrics are, over the scored population unless noted:
 
-- `unreviewed_structured_error_rate`: proportion of all cases that resolved without gating and
+- `unreviewed_structured_error_rate`: proportion of scored cases that resolved without gating and
   had an incorrect structured outcome.
 - `unreviewed_category_error_rate`.
 - `unreviewed_action_error_rate`.
-- `review_load`: proportion of cases gated for approval.
-- `gate_catch_rate`: proportion gated, structurally incorrect, and rejected by the oracle.
+- `review_load`: proportion of scored cases gated for approval.
+- `gate_recall`: `P(gated | not structured_correct)`, the share of wrong outcomes the gate
+  intercepted. This is the question the gate exists to answer.
+- `gate_precision`: `P(not structured_correct | gated)`, how much of the review budget is spent on
+  outcomes that actually needed correcting.
 - Category precision, recall, F1, and confusion matrix.
 - Action accuracy and refund-amount error.
-- Escalation rate and fallback usage.
+- `escalation_rate`, `invalid_output_rate`, and fallback usage, over all cases.
+
+There is deliberately no "gate catch rate" defined as *gated, incorrect, and rejected by the
+oracle*. The oracle rejects exactly when the outcome is incorrect, so such a metric is 1.0 under
+`oracle` and 0.0 under `rubber_stamp` by construction: it measures the reviewer definition rather
+than the gate. `gate_recall` and `gate_precision` are properties of the threshold and are
+reviewer-independent.
 
 Reply relevance, tone, or hallucination are never inferred from category correctness. They are
 reported separately by the validated offline judge.
@@ -247,6 +288,12 @@ not whether fallback routing works. Primary and fallback quality runs are paired
 - The configured timeout and routing reason are recorded.
 - Results are excluded from primary-versus-fallback model-quality headlines.
 
+This profile runs on the **tunable agent under time-skipping Temporal**, over a small case subset.
+Routing is a property of the workflow, not of any model, so paying for real inference here buys
+nothing. `AGENT_SCHEDULE_TO_START_S` defaults to 30 seconds and is copied into a module constant
+at import, so a real-time run would spend at least 30 idle seconds per case; time skipping removes
+that cost entirely, exactly as the existing schedule-to-start test already does.
+
 ### Reliability
 
 `reliability` uses the selected agent with:
@@ -273,13 +320,47 @@ agent outputs. Cache-hit policy runs are excluded from model-latency and reliabi
 For each case and repeat:
 
 1. Assign a unique workflow and ticket ID containing the run, policy, case, and repeat.
-2. Start `TicketWorkflow` on a run-specific task queue.
+2. Start `TicketWorkflow` on a run-specific task queue, under a per-case wall-clock deadline.
 3. Poll until the workflow either reaches `AWAITING_APPROVAL` or terminates.
-4. If approval is required, calculate and submit the selected reviewer decision.
+4. If approval is required, calculate the reviewer decision and submit it with `execute_update`.
 5. Await the terminal `TicketResult`.
 6. Query `TicketWorkflow.status` after completion to capture classification, draft, and decision.
 7. Query refund and refund-attempt rows for the ticket.
 8. Emit one `CaseRecord` plus its `CallEvent` entries.
+
+### Submitting approval
+
+Approval is a workflow **update** with a validator, not a signal. Three consequences shape the
+runner:
+
+- The validator rejects the update unless the workflow is `AWAITING_APPROVAL` and undecided, so
+  the runner must wait for that status first. The existing `wait_for_status` test helper is
+  reused.
+- `submit_approval` blocks until the status leaves `AWAITING_APPROVAL` and returns the terminal
+  status, so awaiting the update already yields the outcome. No second poll is needed.
+- A lost race raises `WorkflowUpdateFailedError`. The runner records it as a case outcome and
+  continues; it never aborts the run.
+
+### Per-case deadline
+
+The fallback activity is dispatched without a schedule-to-start timeout and the workflow has no
+run timeout, so a misconfigured or missing fallback worker parks the activity task indefinitely
+rather than failing. The runner therefore imposes its own wall-clock deadline per case and records
+a `timeout` terminal outcome, so a harness misconfiguration surfaces as a recorded result instead
+of a hung run.
+
+### Environment construction
+
+Two bootstrap requirements are easy to miss and fail immediately:
+
+- Every status transition upserts the `TicketStatus` search attribute, so the harness environment
+  must register that keyword key. Both the time-skipping fixture and the local-server test already
+  do this and show the shape.
+- The client must use `pydantic_data_converter`, matching the production workers.
+
+Workflow queries after completion are served by replaying history on a worker, so workers must
+stay alive until every post-completion query has returned. Worker lifecycle is scoped to the run,
+never to a single case.
 
 The harness moves reusable worker construction out of `tests/helpers.py` into production eval code.
 `tests/helpers.py` re-exports the helper so existing workflow tests remain unchanged.
@@ -345,8 +426,31 @@ code assigns `model="primary"` or `model="fallback"`.
 Error mapping:
 
 - Connection errors, HTTP timeouts, 408, 429, and 5xx become `AgentOverloadedError`.
-- 400, 404/model-not-found, and schema-validation errors become `AgentPermanentError`.
+- 400 and 404/model-not-found become `AgentPermanentError`.
+- Schema-validation failures get a bounded repair budget before becoming `AgentPermanentError`.
 - Failures are recorded in telemetry and never cached.
+
+`AgentOverloadedError` is deliberately left unmapped in the activity layer: it escapes as a
+generic activity failure and is retried by the workflow's own retry loop, which is the intended
+behaviour. It must not be "fixed" into a non-retryable `ApplicationError`.
+
+### Invalid structured output is not a quality signal
+
+`AgentPermanentError` becomes a non-retryable `ApplicationError`, which the workflow re-raises
+immediately, escalating the ticket with no retry and no fallback. Mapping schema-validation
+failures straight onto that path would be actively misleading: the refund action model requires a
+positive refund amount, and a 1.5B fallback model will violate that constraint routinely. The
+fallback-quality profile would then report an escalation rate where it means to report degraded
+classification quality — the exact conflation this harness exists to prevent.
+
+Instead:
+
+- The agent retries a schema-invalid response once, re-asking with the validation error appended
+  to the prompt.
+- Both attempts are recorded, and the outcome `invalid_output` is a distinct `CallEvent` outcome.
+- Only after the repair budget is spent does the failure become `AgentPermanentError`.
+- `invalid_output_rate` is reported as a first-class model-quality metric over all cases. For a
+  deliberately degraded fallback model it is expected to be one of the more informative numbers.
 
 Agent activities send heartbeats at least every 10 seconds while waiting for Ollama. This prevents
 valid calls from tripping the current 30-second heartbeat timeout.
@@ -370,7 +474,9 @@ class CallEvent(BaseModel):
     wall_latency_ms: float
     model_total_duration_ms: float | None
     model_load_duration_ms: float | None
-    outcome: Literal["success", "transient_error", "permanent_error"]
+    outcome: Literal[
+        "success", "invalid_output", "transient_error", "permanent_error"
+    ]
     error_type: str | None
 ```
 
@@ -419,7 +525,13 @@ operation, input, model, prompt, schema, or generation configuration invalidates
 - Reply text and role-based model path.
 - Terminal status, gating, and approval decision.
 - Refund and refund-attempt counts.
+- Whether the case was scorable, and if not, why: escalated, invalid output, update rejected, or
+  runner deadline exceeded.
 - End-to-end latency and terminal error.
+
+Classification, draft, and decision come from the post-completion `status` query. Its `result`
+field is never populated by the workflow and must not be read; the terminal `TicketResult` comes
+from awaiting the workflow handle.
 
 `RunManifest` records:
 
@@ -456,13 +568,29 @@ Before a real-model run:
 8. Record measurements and every timeout adjustment in the manifest.
 9. Probe approximately ten cases for confidence variance.
 
-If draft-confidence standard deviation is below 0.02, the report states that threshold tuning is
-unsupported by the model and suppresses the threshold sweep. A flat confidence distribution is a
-valid finding, not a harness failure.
+The threshold sweep is suppressed unless the probed draft confidences clear **both** gates:
+
+- Standard deviation of at least 0.02.
+- At least five distinct values.
+
+Standard deviation alone is too weak a test for self-reported LLM confidence, which typically
+clusters on two or three values such as 0.9 and 0.95. That distribution can pass a variance
+threshold while producing a step-function sweep with no interior operating points, which is easy
+to over-read as a tradeoff curve. The report states which gate failed. A flat or degenerate
+confidence distribution is a valid finding, not a harness failure.
 
 ---
 
 ## Statistics
+
+### Dependencies
+
+The project currently has no numerical dependency. The clustered bootstrap and the exact McNemar
+test are added through a new `eval` dependency group holding `numpy` and `scipy`, kept out of the
+runtime dependencies so the API and worker images do not grow. The alternative — hand-rolling both
+on the standard library, which is genuinely feasible — is rejected because bootstrap resampling and
+an exact binomial test are precisely the code most likely to be subtly wrong and least likely to be
+caught by tests.
 
 ### Confidence intervals
 
@@ -500,8 +628,12 @@ unreviewed_structured_error_rate =
     P(not gated and not structured_correct)
 ```
 
-The sweep is computed from stored outputs without rerunning models and is rendered only when
-confidence variance passes preflight.
+Both agent calls complete before the workflow evaluates the gate, so re-thresholding stored
+records is a valid counterfactual: changing the threshold changes whether a reply was reviewed,
+never what the model produced. The sweep is therefore computed from stored outputs without
+rerunning models, over the scored population of a single policy's records, and is rendered only
+when confidence variance passes preflight. Cases without a draft have no `draft_confidence` and
+are excluded; the excluded count is printed with the table.
 
 ---
 
@@ -510,8 +642,10 @@ confidence variance passes preflight.
 Each report includes:
 
 - Dataset size, source, difficulty, and category composition.
+- Scored population size beside total cases, with the reason for every exclusion.
 - Directional-only labelling for approximately 50-case runs.
 - Structured quality metrics and confidence intervals.
+- Escalation and invalid-output rates, kept visibly separate from quality metrics.
 - Primary-versus-fallback paired comparisons.
 - Oracle-versus-rubber-stamp outcomes.
 - Review-load versus unreviewed-error threshold table.
@@ -586,7 +720,9 @@ Make targets:
 - `eval-ollama`
 - `eval-compare`
 
-Networked tests use an `ollama` marker and remain deselected by default.
+Networked tests use an `ollama` marker and remain deselected by default. Registering the marker is
+not sufficient on its own: the existing `addopts` deselection must be widened to
+`-m 'not smoke and not ollama'`, or the tests run inside `make check`.
 
 ---
 
@@ -607,6 +743,7 @@ Deliver:
 Acceptance:
 
 - Constructed records with known outcomes produce exact expected metrics.
+- Every reported rate names its denominator, and unscorable cases are excluded from quality rates.
 - Invalid and unverified datasets fail with actionable errors.
 - No Temporal or Ollama process is required.
 
@@ -614,8 +751,9 @@ Acceptance:
 
 Deliver:
 
-- Reusable in-process Temporal harness.
-- Post-completion state capture.
+- Reusable in-process Temporal harness, including search-attribute registration, the Pydantic data
+  converter, and run-scoped worker lifecycle.
+- Post-completion state capture and per-case deadlines.
 - Oracle and rubber-stamp reviewers.
 - Primary-quality, fallback-quality, fallback-routing, and reliability profiles.
 - Stable tunable agent.
@@ -625,7 +763,9 @@ Acceptance:
 
 - A configured exact error set produces the exact expected workflow-level error rates.
 - Output is independent of concurrency and case order.
-- Forced fallback quality is distinct from real fallback routing.
+- Forced fallback quality is distinct from real fallback routing, and routing runs under time
+  skipping without paying the schedule-to-start delay in wall-clock time.
+- A rejected approval update and an exceeded deadline are recorded, not fatal.
 - Existing workflow tests remain unchanged and green.
 
 ### Milestone 3 — Ollama integration
@@ -645,6 +785,8 @@ Acceptance:
 - Primary and fallback quality profiles run over the same limited case set.
 - Policy runs receive byte-identical cached outputs.
 - HTTP, validation, and timeout failures map to the expected agent error classes.
+- A degraded fallback model reports a measurable `invalid_output_rate` rather than escalating
+  every malformed refund.
 - Qwen and Gemma are not resident simultaneously.
 
 ### Milestone 4 — Decision-grade evaluation
@@ -670,6 +812,9 @@ Acceptance:
 - Dataset validation rejects duplicate IDs, empty labels, unverified labels, inconsistent refunds,
   and missing generated provenance.
 - Structured scorer tests use synthetic records with exact expected rates.
+- Scoring tests prove escalated and invalid-output cases are excluded from quality denominators
+  and counted in their own rates, and that `gate_recall` and `gate_precision` are identical under
+  both reviewer policies.
 - Bootstrap tests prove repeats remain clustered by case.
 - Comparison tests cover unchanged runs, meaningful regressions, and underpowered changes that must
   not be flagged.
@@ -680,6 +825,11 @@ Acceptance:
   digest, and generation options.
 - Ollama HTTP tests use a stub transport for success, malformed output, timeout, 400, 404, 408, 429,
   and 5xx behavior.
+- Repair-budget tests prove a schema-invalid response is re-asked once, that a second failure
+  raises `AgentPermanentError`, and that a refund missing its amount does not escalate on the
+  first attempt.
+- Runner tests prove a rejected approval update and an exceeded per-case deadline are recorded as
+  case outcomes rather than aborting the run.
 - Heartbeat tests prove long agent calls cannot hit the 30-second heartbeat timeout.
 - Judge tests cover per-dimension calibration gates and versioned output.
 - A complete `make check` remains the final repository regression gate.
@@ -695,11 +845,18 @@ Acceptance:
 3. **A stale cache corrupts paired comparisons.** Hash the complete request and model identity.
 4. **Category error is presented as reply error.** Keep structured and judged reply metrics
    separate.
-5. **Small samples are over-interpreted.** Always report intervals and mark N≈50 runs directional.
-6. **Confidence is constant or meaningless.** Diagnose variance and suppress unsupported sweeps.
-7. **Generated data is easier than real traffic.** Require human verification and report by source.
-8. **Judge scores appear authoritative.** Gate each dimension on human agreement and show the
+5. **Availability failure is presented as model error.** A schema-invalid response escalates the
+   ticket without retry or fallback. Give validation failures a repair budget, report
+   `invalid_output_rate` and `escalation_rate` separately, and score quality only over cases that
+   produced a draft.
+6. **Small samples are over-interpreted.** Always report intervals and mark N≈50 runs directional.
+7. **Confidence is constant or meaningless.** Diagnose variance and distinctness, and suppress
+   unsupported sweeps.
+8. **Generated data is easier than real traffic.** Require human verification and report by source.
+9. **Judge scores appear authoritative.** Gate each dimension on human agreement and show the
    calibration result.
+10. **A missing worker hangs the run.** The fallback activity has no schedule-to-start timeout, so
+    the runner enforces its own per-case deadline.
 
 ---
 
@@ -711,7 +868,8 @@ The harness is complete when:
 - The tunable profile reproduces exact injected structured-error rates.
 - Limited primary and fallback Ollama runs produce immutable, reproducible artifacts.
 - Fallback model quality and fallback routing are reported as different experiments.
-- Every inferential headline rate includes a 95% interval.
+- Every inferential headline rate includes a 95% interval and names its denominator.
+- Model quality, availability, and reviewer policy are reported as separate quantities.
 - The threshold report either presents a defensible tradeoff curve or explicitly explains why the
   model's confidence cannot support threshold tuning.
 - Judge-derived metrics appear only for validated dimensions.
