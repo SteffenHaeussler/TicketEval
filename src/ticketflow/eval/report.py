@@ -1,99 +1,23 @@
-"""Markdown/console rendering of the M1 deterministic metrics (plan.md's Reporting)."""
+"""Markdown rendering of the M1 deterministic metrics (plan.md's Reporting)."""
 
-from collections.abc import Callable, Sequence
+from collections import Counter
+from collections.abc import Sequence
 
 from ticketflow.eval.records import CallEvent, CaseRecord
 from ticketflow.eval.scorers.deterministic import (
     DeterministicMetrics,
     Rate,
-    action_correct,
-    category_correct,
+    RateSeries,
+    build_rate_series,
+    category_f1_clustered_values,
+    category_precision_clustered_values,
+    category_recall_clustered_values,
     score_run,
-    structured_correct,
 )
-from ticketflow.eval.statistics import Interval, bootstrap_ci
+from ticketflow.eval.statistics import Interval, bootstrap_ci, clustered_statistic_ci
 from ticketflow.models import TicketCategory
 
 _DIRECTIONAL_ONLY_THRESHOLD = 100
-
-
-def _scored_pairs(
-    records: Sequence[CaseRecord], predicate: Callable[[CaseRecord], bool]
-) -> list[tuple[str, float]]:
-    """Return (case_key, 0/1) pairs over the scored population for predicate."""
-    return [
-        (r.case_key, float(predicate(r))) for r in records if r.prediction_available
-    ]
-
-
-def _incorrect_scored_pairs(
-    records: Sequence[CaseRecord], predicate: Callable[[CaseRecord], bool]
-) -> list[tuple[str, float]]:
-    """Return (case_key, 0/1) pairs over scored cases with an incorrect outcome."""
-    return [
-        (r.case_key, float(predicate(r)))
-        for r in records
-        if r.prediction_available and not structured_correct(r)
-    ]
-
-
-def _gated_scored_pairs(
-    records: Sequence[CaseRecord], predicate: Callable[[CaseRecord], bool]
-) -> list[tuple[str, float]]:
-    """Return (case_key, 0/1) pairs over gated scored cases."""
-    return [
-        (r.case_key, float(predicate(r)))
-        for r in records
-        if r.prediction_available and r.was_gated
-    ]
-
-
-def _class_precision_pairs(
-    records: Sequence[CaseRecord], category: TicketCategory
-) -> list[tuple[str, float]]:
-    """Return (case_key, 0/1) pairs over scored cases predicted as category."""
-    return [
-        (r.case_key, float(r.expected.reference_category == category))
-        for r in records
-        if r.prediction_available and r.predicted_category == category
-    ]
-
-
-def _class_recall_pairs(
-    records: Sequence[CaseRecord], category: TicketCategory
-) -> list[tuple[str, float]]:
-    """Return (case_key, 0/1) pairs over scored cases whose reference is category."""
-    return [
-        (r.case_key, float(r.predicted_category == category))
-        for r in records
-        if r.prediction_available and r.expected.reference_category == category
-    ]
-
-
-def _case_identity(obj: CaseRecord | CallEvent) -> tuple[str, str, str, int, str]:
-    """Return the (run_id, policy, case_key, repeat_index, ticket_id) join key."""
-    return (obj.run_id, obj.policy, obj.case_key, obj.repeat_index, obj.ticket_id)
-
-
-def _event_flag_pairs(
-    records: Sequence[CaseRecord],
-    events: Sequence[CallEvent],
-    predicate: Callable[[CallEvent], bool],
-) -> list[tuple[str, float]]:
-    """Return (case_key, 0/1) pairs flagging cases whose events match predicate."""
-    flagged = {_case_identity(e) for e in events if predicate(e)}
-    return [(r.case_key, float(_case_identity(r) in flagged)) for r in records]
-
-
-def _unhelpful_outcome_pairs(records: Sequence[CaseRecord]) -> list[tuple[str, float]]:
-    """Return (case_key, 0/1) pairs combining unavailability and structured errors."""
-    return [
-        (
-            r.case_key,
-            float((not r.prediction_available) or (not structured_correct(r))),
-        )
-        for r in records
-    ]
 
 
 def _refund_error_pairs(records: Sequence[CaseRecord]) -> list[tuple[str, float]]:
@@ -114,6 +38,29 @@ def _interval_or_none(
     if not pairs:
         return None
     return bootstrap_ci(pairs, seed=seed, n_resamples=n_resamples)
+
+
+def _f1_statistic(observations: Sequence[tuple[bool, bool]]) -> float:
+    """Compute F1 from (is_reference, is_predicted) observations."""
+    tp = sum(reference and predicted for reference, predicted in observations)
+    fp = sum(not reference and predicted for reference, predicted in observations)
+    fn = sum(reference and not predicted for reference, predicted in observations)
+    return 2 * tp / (2 * tp + fp + fn)
+
+
+def _f1_interval_or_none(
+    records: Sequence[CaseRecord],
+    category: TicketCategory,
+    seed: int,
+    n_resamples: int,
+) -> Interval | None:
+    """Return the category F1 interval, or None when its denominator is empty."""
+    values = category_f1_clustered_values(records, category)
+    if not values:
+        return None
+    return clustered_statistic_ci(
+        values, statistic=_f1_statistic, seed=seed, n_resamples=n_resamples
+    )
 
 
 def _percent(value: float) -> str:
@@ -154,56 +101,26 @@ def _format_refund_error_line(
 def _render_quality_metrics(
     records: Sequence[CaseRecord],
     metrics: DeterministicMetrics,
+    series_by_name: dict[str, RateSeries],
     seed: int,
     n_resamples: int,
 ) -> list[str]:
     """Render Quality Metrics; every rate carries an interval and a denominator."""
     lines = ["## Quality Metrics", ""]
 
-    rate_specs: list[tuple[str, Rate, list[tuple[str, float]]]] = [
-        (
-            "Unreviewed structured-error rate",
-            metrics.unreviewed_structured_error_rate,
-            _scored_pairs(
-                records, lambda r: not r.was_gated and not structured_correct(r)
-            ),
-        ),
-        (
-            "Unreviewed category-error rate",
-            metrics.unreviewed_category_error_rate,
-            _scored_pairs(
-                records, lambda r: not r.was_gated and not category_correct(r)
-            ),
-        ),
-        (
-            "Unreviewed action-error rate",
-            metrics.unreviewed_action_error_rate,
-            _scored_pairs(records, lambda r: not r.was_gated and not action_correct(r)),
-        ),
-        (
-            "Review load",
-            metrics.review_load,
-            _scored_pairs(records, lambda r: r.was_gated),
-        ),
-        (
-            "Gate recall",
-            metrics.gate_recall,
-            _incorrect_scored_pairs(records, lambda r: r.was_gated),
-        ),
-        (
-            "Gate precision",
-            metrics.gate_precision,
-            _gated_scored_pairs(records, lambda r: not structured_correct(r)),
-        ),
-        (
-            "Action accuracy",
-            metrics.action_accuracy,
-            _scored_pairs(records, action_correct),
-        ),
+    rate_specs = [
+        ("Unreviewed structured-error rate", "unreviewed_structured_error_rate"),
+        ("Unreviewed category-error rate", "unreviewed_category_error_rate"),
+        ("Unreviewed action-error rate", "unreviewed_action_error_rate"),
+        ("Review load", "review_load"),
+        ("Gate recall", "gate_recall"),
+        ("Gate precision", "gate_precision"),
+        ("Action accuracy", "action_accuracy"),
     ]
-    for label, rate, pairs in rate_specs:
-        interval = _interval_or_none(pairs, seed, n_resamples)
-        lines.append(_format_rate_line(label, rate, interval))
+    for label, name in rate_specs:
+        series = series_by_name[name]
+        interval = _interval_or_none(list(series.clustered_values), seed, n_resamples)
+        lines.append(_format_rate_line(label, series.rate, interval))
 
     refund_pairs = _refund_error_pairs(records)
     refund_interval = _interval_or_none(refund_pairs, seed, n_resamples)
@@ -249,6 +166,40 @@ def _render_header(records: Sequence[CaseRecord], scored: int, total: int) -> li
     return lines
 
 
+def _render_dataset_composition(records: Sequence[CaseRecord]) -> list[str]:
+    """Render dataset composition once per unique case key, ignoring repeats."""
+    unique_records = {record.case_key: record for record in records}
+    difficulties = Counter(record.difficulty for record in unique_records.values())
+    sources = Counter(record.source for record in unique_records.values())
+    categories = Counter(
+        record.expected.reference_category.value for record in unique_records.values()
+    )
+    return [
+        "## Dataset Composition",
+        "",
+        f"Unique cases: {len(unique_records)}",
+        (
+            "Difficulty: "
+            f"easy {difficulties['easy']}, "
+            f"ambiguous {difficulties['ambiguous']}, "
+            f"adversarial {difficulties['adversarial']}"
+        ),
+        (
+            "Source: "
+            f"handwritten {sources['handwritten']}, "
+            f"generated {sources['generated']}"
+        ),
+        (
+            "Reference category: "
+            f"billing {categories['billing']}, "
+            f"technical {categories['technical']}, "
+            f"account {categories['account']}, "
+            f"general {categories['general']}"
+        ),
+        "",
+    ]
+
+
 def _render_confusion_matrix(metrics: DeterministicMetrics) -> list[str]:
     """Render the reference-by-predicted confusion matrix as a Markdown table."""
     matrix = metrics.category_confusion_matrix
@@ -277,14 +228,15 @@ def _render_per_class_metrics(
     for category in TicketCategory:
         class_metrics = metrics.category_class_metrics[category]
         precision_interval = _interval_or_none(
-            _class_precision_pairs(records, category), seed, n_resamples
+            category_precision_clustered_values(records, category), seed, n_resamples
         )
         recall_interval = _interval_or_none(
-            _class_recall_pairs(records, category), seed, n_resamples
+            category_recall_clustered_values(records, category), seed, n_resamples
         )
         precision_text = _format_rate_value(class_metrics.precision, precision_interval)
         recall_text = _format_rate_value(class_metrics.recall, recall_interval)
-        f1_text = "n/a" if class_metrics.f1 is None else f"{class_metrics.f1:.3f}"
+        f1_interval = _f1_interval_or_none(records, category, seed, n_resamples)
+        f1_text = _format_rate_value(class_metrics.f1, f1_interval)
         lines.append(f"- **{category.value}**")
         lines.append(f"  - Precision: {precision_text}")
         lines.append(f"  - Recall: {recall_text}")
@@ -294,9 +246,7 @@ def _render_per_class_metrics(
 
 
 def _render_escalation_and_availability(
-    records: Sequence[CaseRecord],
-    events: Sequence[CallEvent],
-    metrics: DeterministicMetrics,
+    series_by_name: dict[str, RateSeries],
     seed: int,
     n_resamples: int,
 ) -> list[str]:
@@ -308,31 +258,16 @@ def _render_escalation_and_availability(
         "as structured-quality errors._",
         "",
     ]
-    rate_specs: list[tuple[str, Rate, list[tuple[str, float]]]] = [
-        (
-            "Escalation rate",
-            metrics.escalation_rate,
-            [(r.case_key, float(r.terminal_outcome == "escalated")) for r in records],
-        ),
-        (
-            "Invalid-output rate",
-            metrics.invalid_output_rate,
-            _event_flag_pairs(records, events, lambda e: e.outcome == "invalid_output"),
-        ),
-        (
-            "Fallback usage rate",
-            metrics.fallback_usage_rate,
-            _event_flag_pairs(records, events, lambda e: e.role == "fallback"),
-        ),
-        (
-            "Unhelpful outcome rate",
-            metrics.unhelpful_outcome_rate,
-            _unhelpful_outcome_pairs(records),
-        ),
+    rate_specs = [
+        ("Escalation rate", "escalation_rate"),
+        ("Invalid-output rate", "invalid_output_rate"),
+        ("Fallback usage rate", "fallback_usage_rate"),
+        ("Unhelpful outcome rate", "unhelpful_outcome_rate"),
     ]
-    for label, rate, pairs in rate_specs:
-        interval = _interval_or_none(pairs, seed, n_resamples)
-        lines.append(_format_rate_line(label, rate, interval))
+    for label, name in rate_specs:
+        series = series_by_name[name]
+        interval = _interval_or_none(list(series.clustered_values), seed, n_resamples)
+        lines.append(_format_rate_line(label, series.rate, interval))
     lines.append("")
     return lines
 
@@ -346,30 +281,21 @@ def render_markdown(
 ) -> str:
     """Render the M1 deterministic metrics report as Markdown."""
     metrics = score_run(records, events)
+    series_by_name = build_rate_series(records, events)
     lines = _render_header(
         records, metrics.scored_population_size, metrics.total_population_size
     )
-    lines.extend(_render_quality_metrics(records, metrics, bootstrap_seed, n_resamples))
+    lines.extend(_render_dataset_composition(records))
+    lines.extend(
+        _render_quality_metrics(
+            records, metrics, series_by_name, bootstrap_seed, n_resamples
+        )
+    )
     lines.extend(_render_confusion_matrix(metrics))
     lines.extend(
         _render_per_class_metrics(records, metrics, bootstrap_seed, n_resamples)
     )
     lines.extend(
-        _render_escalation_and_availability(
-            records, events, metrics, bootstrap_seed, n_resamples
-        )
+        _render_escalation_and_availability(series_by_name, bootstrap_seed, n_resamples)
     )
     return "\n".join(lines)
-
-
-def render_console(
-    records: Sequence[CaseRecord],
-    events: Sequence[CallEvent],
-    *,
-    bootstrap_seed: int,
-    n_resamples: int = 5000,
-) -> str:
-    """Return the deterministic metrics report as plain console text."""
-    return render_markdown(
-        records, events, bootstrap_seed=bootstrap_seed, n_resamples=n_resamples
-    )

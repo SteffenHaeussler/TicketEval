@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 from scipy.stats import binomtest
 
+from ticketflow.eval import statistics as eval_statistics
 from ticketflow.eval.statistics import (
     Interval,
     McNemarResult,
@@ -82,6 +83,32 @@ class TestBootstrapCi:
 
         assert isinstance(result, Interval)
         assert result.confidence == 0.95
+        assert result.low <= result.point <= result.high
+
+
+class TestClusteredStatisticCi:
+    def test_supports_a_derived_statistic_over_structured_values(self):
+        values = [
+            ("a", (True, True)),
+            ("b", (True, False)),
+            ("c", (False, True)),
+        ]
+
+        def f1(observations):
+            tp = sum(reference and predicted for reference, predicted in observations)
+            fp = sum(
+                not reference and predicted for reference, predicted in observations
+            )
+            fn = sum(
+                reference and not predicted for reference, predicted in observations
+            )
+            return 2 * tp / (2 * tp + fp + fn)
+
+        result = eval_statistics.clustered_statistic_ci(
+            values, statistic=f1, seed=4, n_resamples=100
+        )
+
+        assert result.point == 0.5
         assert result.low <= result.point <= result.high
 
 

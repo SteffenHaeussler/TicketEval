@@ -2,6 +2,7 @@ import pytest
 from pydantic import ValidationError
 
 from tests.eval.test_records import make_call_event, make_case_record, make_expected
+from ticketflow.eval.scorers import deterministic
 from ticketflow.eval.scorers.deterministic import (
     ConfusionMatrix,
     MissingPredictionFieldError,
@@ -568,14 +569,6 @@ def test_category_correct_raises_missing_field_error_when_predicted_category_non
         category_correct(record)
 
 
-def test_action_correct_raises_missing_field_error_when_predicted_action_none():
-    record = make_case_record(
-        draft_confidence=0.9, prediction_available=True, predicted_action=None
-    )
-    with pytest.raises(MissingPredictionFieldError, match="case-1"):
-        action_correct(record)
-
-
 # --- scored-population exclusion ---
 
 
@@ -736,7 +729,11 @@ def test_category_class_metrics_billing_precision_recall_f1():
     assert metrics.recall == Rate(
         numerator=5, denominator=7, denominator_label="reference_billing"
     )
-    assert metrics.f1 == pytest.approx(0.8333333, rel=1e-6)
+    assert metrics.f1 == Rate(
+        numerator=10,
+        denominator=12,
+        denominator_label="f1_2tp_plus_fp_plus_fn_billing",
+    )
 
 
 def test_category_class_metrics_zero_precision_and_recall_gives_f1_zero_not_none():
@@ -744,7 +741,7 @@ def test_category_class_metrics_zero_precision_and_recall_gives_f1_zero_not_none
     metrics = category_class_metrics(matrix)[TicketCategory.TECHNICAL]
     assert metrics.precision.value == 0.0
     assert metrics.recall.value == 0.0
-    assert metrics.f1 == 0.0
+    assert metrics.f1.value == 0.0
 
 
 def test_category_class_metrics_perfect_class_has_f1_one():
@@ -752,7 +749,7 @@ def test_category_class_metrics_perfect_class_has_f1_one():
     metrics = category_class_metrics(matrix)[TicketCategory.ACCOUNT]
     assert metrics.precision.value == 1.0
     assert metrics.recall.value == 1.0
-    assert metrics.f1 == 1.0
+    assert metrics.f1.value == 1.0
 
 
 def test_category_class_metrics_general_precision_recall_f1():
@@ -760,7 +757,7 @@ def test_category_class_metrics_general_precision_recall_f1():
     metrics = category_class_metrics(matrix)[TicketCategory.GENERAL]
     assert metrics.precision.value == pytest.approx(1 / 3)
     assert metrics.recall.value == 1.0
-    assert metrics.f1 == pytest.approx(0.5)
+    assert metrics.f1.value == pytest.approx(0.5)
 
 
 # --- refund amount error ---
@@ -916,6 +913,58 @@ def test_score_run_reproduces_every_hand_computed_metric():
     )
     assert metrics.unhelpful_outcome_rate.numerator == 8
     assert metrics.unhelpful_outcome_rate.denominator == 14
+
+
+def test_rate_series_are_the_source_of_score_run_rate_fields():
+    series_by_name = deterministic.build_rate_series(FIXTURE_RECORDS, FIXTURE_EVENTS)
+    metrics = score_run(FIXTURE_RECORDS, FIXTURE_EVENTS)
+
+    expected_names = {
+        "unreviewed_structured_error_rate",
+        "unreviewed_category_error_rate",
+        "unreviewed_action_error_rate",
+        "review_load",
+        "gate_recall",
+        "gate_precision",
+        "action_accuracy",
+        "escalation_rate",
+        "invalid_output_rate",
+        "fallback_usage_rate",
+        "unhelpful_outcome_rate",
+    }
+    assert set(series_by_name) == expected_names
+    for name, series in series_by_name.items():
+        assert series.rate == getattr(metrics, name)
+        assert len(series.clustered_values) == series.rate.denominator
+
+
+def test_category_f1_clustered_values_use_only_records_in_f1_denominator():
+    values = deterministic.category_f1_clustered_values(
+        FIXTURE_RECORDS, TicketCategory.BILLING
+    )
+
+    assert len(values) == 7
+    assert all(
+        is_reference or is_predicted for _, (is_reference, is_predicted) in values
+    )
+
+
+def test_category_precision_clustered_values_match_predicted_population():
+    values = deterministic.category_precision_clustered_values(
+        FIXTURE_RECORDS, TicketCategory.BILLING
+    )
+
+    assert len(values) == 5
+    assert sum(value for _, value in values) == 5
+
+
+def test_category_recall_clustered_values_match_reference_population():
+    values = deterministic.category_recall_clustered_values(
+        FIXTURE_RECORDS, TicketCategory.BILLING
+    )
+
+    assert len(values) == 7
+    assert sum(value for _, value in values) == 5
 
 
 # --- T6-prep helper ---

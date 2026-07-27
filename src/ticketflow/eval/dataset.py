@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from ticketflow.models import ActionType, TicketCategory
 
@@ -27,9 +27,11 @@ class DatasetValidationError(DatasetError):
 class ExpectedOutcome(BaseModel):
     """Acceptable and reference outcome labels for one eval case."""
 
-    acceptable_categories: set[TicketCategory]
+    model_config = ConfigDict(frozen=True)
+
+    acceptable_categories: frozenset[TicketCategory]
     reference_category: TicketCategory
-    acceptable_actions: set[ActionType]
+    acceptable_actions: frozenset[ActionType]
     expected_refund_amount: float | None = None
     refund_tolerance: float = 0.01
 

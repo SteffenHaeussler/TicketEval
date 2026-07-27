@@ -51,9 +51,9 @@ class CallEvent(BaseModel):
 class CaseRecord(BaseModel):
     """Immutable per-case run outcome, per plan.md's run-artifacts section.
 
-    Top-level fields are frozen, but `expected` (ExpectedOutcome) and `decision`
-    (ApprovalDecision) are ordinary mutable models owned by other modules; mutating
-    into them bypasses this record's immutability guarantee.
+    Top-level fields and scoring-critical expected labels are frozen. The nested
+    production ApprovalDecision is treated as read-only by convention; persisted
+    raw artifacts are strictly write-once.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -102,12 +102,43 @@ class CaseRecord(BaseModel):
     @model_validator(mode="after")
     def _prediction_available_matches_draft_presence(self) -> "CaseRecord":
         """Enforce that prediction_available is derived solely from draft presence."""
-        expected_value = self.draft_confidence is not None
+        expected_value = self.reply_text is not None
         if self.prediction_available != expected_value:
             raise ValueError(
                 f"case {self.case_key!r}: prediction_available="
                 f"{self.prediction_available} does not match draft presence "
-                f"(draft_confidence is {'set' if expected_value else 'None'})"
+                f"(reply_text is {'set' if expected_value else 'None'})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _draft_fields_match_reply_presence(self) -> "CaseRecord":
+        """Keep flattened draft fields consistent with captured reply presence."""
+        has_reply = self.reply_text is not None
+        if has_reply and self.predicted_action is None:
+            raise ValueError(
+                f"case {self.case_key!r}: predicted_action is required when "
+                "reply_text is set"
+            )
+        if has_reply and self.draft_confidence is None:
+            raise ValueError(
+                f"case {self.case_key!r}: draft_confidence is required when "
+                "reply_text is set"
+            )
+        if not has_reply and self.predicted_action is not None:
+            raise ValueError(
+                f"case {self.case_key!r}: predicted_action must be None when "
+                "reply_text is None"
+            )
+        if not has_reply and self.draft_confidence is not None:
+            raise ValueError(
+                f"case {self.case_key!r}: draft_confidence must be None when "
+                "reply_text is None"
+            )
+        if not has_reply and self.predicted_refund_amount is not None:
+            raise ValueError(
+                f"case {self.case_key!r}: predicted_refund_amount must be None when "
+                "reply_text is None"
             )
         return self
 
@@ -129,7 +160,11 @@ class CaseRecord(BaseModel):
 
 
 class RunManifest(BaseModel):
-    """Immutable run config/provenance snapshot, per plan.md's manifest bullets."""
+    """Frozen run config/provenance snapshot, per plan.md's manifest bullets.
+
+    Nested JSON-like values are treated as read-only by convention. Once written,
+    the persisted manifest is strictly write-once.
+    """
 
     model_config = ConfigDict(frozen=True)
 

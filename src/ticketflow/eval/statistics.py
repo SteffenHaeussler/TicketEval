@@ -7,11 +7,13 @@ independently of the record models built on top of it.
 
 from collections.abc import Callable, Hashable, Sequence
 from dataclasses import dataclass
+from typing import TypeVar
 
 import numpy as np
 from scipy.stats import binomtest
 
 _THRESHOLD_STEPS = 21
+ValueT = TypeVar("ValueT")
 
 
 def _mean(values: Sequence[float]) -> float:
@@ -39,22 +41,22 @@ def _percentile_bounds(
     return float(low), float(high)
 
 
-def bootstrap_ci(
-    clustered_values: Sequence[tuple[Hashable, float]],
+def clustered_statistic_ci(
+    clustered_values: Sequence[tuple[Hashable, ValueT]],
     *,
+    statistic: Callable[[Sequence[ValueT]], float],
     seed: int,
     n_resamples: int = 5000,
     confidence: float = 0.95,
-    statistic: Callable[[Sequence[float]], float] = _mean,
 ) -> Interval:
-    """Return a case-clustered percentile bootstrap interval over clustered_values.
+    """Bootstrap any statistic while resampling complete case clusters.
 
     Each resample draws cluster ids with replacement and keeps every value
     belonging to a drawn cluster, so repeated observations within a cluster never
     add resampling variance beyond the cluster-level draw.
     """
-    by_cluster: dict[Hashable, list[float]] = {}
-    all_values: list[float] = []
+    by_cluster: dict[Hashable, list[ValueT]] = {}
+    all_values: list[ValueT] = []
     for cluster_id, value in clustered_values:
         by_cluster.setdefault(cluster_id, []).append(value)
         all_values.append(value)
@@ -70,6 +72,24 @@ def bootstrap_ci(
     low, high = _percentile_bounds(resample_stats, confidence)
     return Interval(
         point=statistic(all_values), low=low, high=high, confidence=confidence
+    )
+
+
+def bootstrap_ci(
+    clustered_values: Sequence[tuple[Hashable, float]],
+    *,
+    seed: int,
+    n_resamples: int = 5000,
+    confidence: float = 0.95,
+    statistic: Callable[[Sequence[float]], float] = _mean,
+) -> Interval:
+    """Return a case-clustered percentile bootstrap interval over numeric values."""
+    return clustered_statistic_ci(
+        clustered_values,
+        statistic=statistic,
+        seed=seed,
+        n_resamples=n_resamples,
+        confidence=confidence,
     )
 
 

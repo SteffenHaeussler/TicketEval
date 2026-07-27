@@ -275,7 +275,7 @@ def test_run_manifest_round_trips_through_json(tmp_path):
     assert loaded == manifest
 
 
-def test_case_record_round_trip_preserves_expected_outcome_set_field(tmp_path):
+def test_case_record_round_trip_preserves_expected_outcome_label_collection(tmp_path):
     path = tmp_path / "records.jsonl"
     expected = make_expected(
         acceptable_categories=["billing", "technical"], reference_category="billing"
@@ -286,7 +286,7 @@ def test_case_record_round_trip_preserves_expected_outcome_set_field(tmp_path):
     [loaded] = read_case_records(path)
 
     assert loaded.expected.acceptable_categories == {"billing", "technical"}
-    assert isinstance(loaded.expected.acceptable_categories, set)
+    assert isinstance(loaded.expected.acceptable_categories, frozenset)
 
 
 # --- prediction_available invariant ---
@@ -302,14 +302,72 @@ def test_prediction_available_true_regardless_of_terminal_outcome():
     assert update_rejected.prediction_available is True
 
 
-def test_prediction_available_mismatch_with_draft_confidence_raises():
+def test_prediction_available_true_without_reply_raises():
     with pytest.raises(ValidationError, match="case-1"):
-        make_case_record(prediction_available=True, draft_confidence=None)
+        make_case_record(prediction_available=True, reply_text=None)
 
 
-def test_prediction_available_false_with_draft_confidence_set_raises():
+def test_prediction_available_false_with_reply_raises():
     with pytest.raises(ValidationError, match="case-1"):
-        make_case_record(prediction_available=False, draft_confidence=0.9)
+        make_case_record(prediction_available=False, reply_text="A captured draft")
+
+
+def test_reply_requires_predicted_action():
+    with pytest.raises(ValidationError, match="case-1.*predicted_action"):
+        make_case_record(reply_text="A captured draft", predicted_action=None)
+
+
+def test_reply_requires_draft_confidence():
+    with pytest.raises(ValidationError, match="case-1.*draft_confidence"):
+        make_case_record(reply_text="A captured draft", draft_confidence=None)
+
+
+def test_no_reply_rejects_draft_confidence():
+    with pytest.raises(ValidationError, match="case-1.*draft_confidence"):
+        make_case_record(
+            reply_text=None,
+            draft_confidence=0.8,
+            predicted_action=None,
+            prediction_available=False,
+        )
+
+
+def test_no_reply_rejects_predicted_action():
+    with pytest.raises(ValidationError, match="case-1.*predicted_action"):
+        make_case_record(
+            reply_text=None,
+            draft_confidence=None,
+            predicted_action="reply_only",
+            prediction_available=False,
+        )
+
+
+def test_no_reply_rejects_predicted_refund_amount():
+    with pytest.raises(ValidationError, match="case-1.*predicted_refund_amount"):
+        make_case_record(
+            reply_text=None,
+            draft_confidence=None,
+            predicted_action=None,
+            predicted_refund_amount=10.0,
+            prediction_available=False,
+        )
+
+
+def test_classification_only_failed_draft_is_constructible():
+    record = make_case_record(
+        predicted_category="technical",
+        classification_confidence=0.8,
+        predicted_action=None,
+        draft_confidence=None,
+        reply_text=None,
+        prediction_available=False,
+        terminal_outcome="escalated",
+        prediction_unavailable_reason="draft failed",
+    )
+
+    assert record.predicted_category == "technical"
+    assert record.classification_confidence == 0.8
+    assert record.prediction_available is False
 
 
 # --- cleanup_action invariant ---
@@ -361,6 +419,21 @@ def test_case_record_is_frozen():
     record = make_case_record()
     with pytest.raises(ValidationError):
         record.run_id = "other"
+
+
+def test_expected_outcome_is_frozen_with_immutable_label_collections():
+    expected = make_expected(
+        acceptable_categories=["billing", "technical"],
+        acceptable_actions=["reply_only", "refund"],
+        expected_refund_amount=10.0,
+    )
+
+    assert expected.acceptable_categories == frozenset({"billing", "technical"})
+    assert expected.acceptable_actions == frozenset({"reply_only", "refund"})
+    with pytest.raises(ValidationError):
+        setattr(expected, "reference_category", "technical")
+    with pytest.raises(AttributeError):
+        getattr(expected.acceptable_categories, "add")("account")
 
 
 def test_call_event_is_frozen():
