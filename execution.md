@@ -72,11 +72,16 @@ These four refinements remove single-owner bottlenecks and are now reflected in 
 
 ### One gotcha and one ambiguity
 
-**Gotcha — the `eval` dependency group must be installed for `make check` to pass.** `plan.md` puts
-`numpy` and `scipy` in a non-runtime `eval` group so the API and worker images do not grow. But
-`make test` collects `tests/eval/test_statistics.py`, which imports them. `make install` therefore
-has to sync that group (`uv sync --all-groups`), or `make check` fails on a clean checkout. Docker
-images are unaffected because they install runtime dependencies only. Resolved in `M1-T1`.
+**Gotcha (superseded) — eval tests are marker-deselected from `make check`, not dependency-synced
+into it.** An earlier revision of this plan assumed `make test`/`make check` would collect
+`tests/eval/test_statistics.py` and therefore need `numpy`/`scipy` installed via
+`uv sync --all-groups`. Instead, every test under `tests/eval/` is auto-tagged with a new `eval`
+pytest marker (`tests/eval/conftest.py`), and `addopts` is `-m 'not smoke and not eval'` — the same
+deselection mechanism already used for `smoke`. `make test`/`make check` therefore never collect
+`tests/eval/`, whether or not the `eval` dependency group is installed. A dedicated
+`make test-eval` (`uv run pytest -m eval -o addopts=`) runs them explicitly. `make install` does
+not need `--all-groups` for `make check` to pass; it only matters for `make test-eval` and
+`make eval*`. Resolved in `M1-T2`, not `M1-T1`.
 
 **Ambiguity — where does the threshold sweep live?** `plan.md`'s architecture comment assigns it to
 `statistics.py` in milestone 1; the milestone 4 deliverables list "Threshold sweep and confidence
@@ -140,12 +145,17 @@ format, the metric definitions, the statistics, and the report.
 ### M1-T1 — Repo scaffolding
 
 Prepare the repository for eval work so no later task has to touch shared config. Add an `eval`
-dependency group holding `numpy` and `scipy`, and switch `make install` to `uv sync --all-groups`
-so the statistics tests can run under `make check`. Register the `ollama` pytest marker and widen
-`addopts` from `-m 'not smoke'` to `-m 'not smoke and not ollama'` — registering the marker alone
-is not enough, the tests would still run. Add `evals/runs/` and `evals/cache/` to `.gitignore`,
-leaving `evals/data/` committed. Create the empty `eval/` and `eval/scorers/` packages and
-`tests/eval/__init__.py`.
+dependency group holding `numpy` and `scipy`, and switch `make install` to `uv sync --all-groups` so
+statistics tests have `numpy`/`scipy` available under `make test-eval` — they are never collected by
+`make check` at all (see below), so this is about the eval dependency group being installed, not
+about `make check` needing it. Register the `ollama` pytest marker and widen `addopts` from
+`-m 'not smoke and not eval'` to `-m 'not smoke and not eval and not ollama'` — registering the
+marker alone is not enough, the tests would still run. (`M1-T2` already introduced the `eval` marker
+and the `tests/eval/conftest.py` auto-tagging hook, deselecting every test under `tests/eval/` from
+the default `make test`/`make check` gate; T1 only adds the `ollama` deselection on top of it.) Add
+`evals/runs/` and `evals/cache/` to `.gitignore`, leaving `evals/data/` committed. Create the empty
+`eval/` and `eval/scorers/` packages (`tests/eval/__init__.py` and `tests/eval/conftest.py` already
+exist from `M1-T2`).
 
 **Acceptance**
 

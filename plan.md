@@ -889,9 +889,12 @@ Make targets:
 - `eval-ollama`
 - `eval-compare`
 
-Networked tests use an `ollama` marker and remain deselected by default. Registering the marker is
-not sufficient on its own: the existing `addopts` deselection must be widened to
-`-m 'not smoke and not ollama'`, or the tests run inside `make check`.
+Every test under `tests/eval/` carries an `eval` marker, applied automatically by
+`tests/eval/conftest.py` rather than per-file, and is deselected from the default `make test`/
+`make check` gate by `addopts = "-m 'not smoke and not eval'"`. `make test-eval` runs them
+explicitly (`uv run pytest -m eval -o addopts=`). Networked Ollama tests carry a further `ollama`
+marker and remain deselected by default. Registering a marker is not sufficient on its own: the
+`addopts` deselection must list it explicitly, or the tests run inside `make check`.
 
 ---
 

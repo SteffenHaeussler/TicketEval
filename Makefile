@@ -1,4 +1,4 @@
-.PHONY: install install-hooks lint format-check format typecheck check test coverage smoke test-docker test-docker-tracing server server-docker up down logs stack-reset jaeger search-attributes worker llm-worker api doctor ticket status approve reject batch reset
+.PHONY: install install-hooks lint format-check format typecheck check test test-eval coverage smoke test-docker test-docker-tracing server server-docker up down logs stack-reset jaeger search-attributes worker llm-worker api doctor ticket status approve reject batch reset
 
 N ?= 100
 API_URL ?= http://localhost:8000
@@ -30,6 +30,9 @@ check: format-check lint typecheck test
 
 test:
 	uv run pytest
+
+test-eval:
+	uv run pytest -m eval -o addopts=
 
 coverage:
 	uv run pytest --cov=ticketflow --cov-report=term-missing
