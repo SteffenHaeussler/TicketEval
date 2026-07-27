@@ -12,8 +12,8 @@ This document says *who does what, in which order, touching which files*. It kee
 milestones intact and splits each into subtasks small enough to hand to one agent or one sitting.
 
 **Task IDs** are `M<milestone>-T<n>` — `M2-T4` is the fourth task of milestone 2. Lettered variants
-(`M1-T3a`) are sibling tasks that could otherwise have been one task, split apart only because they
-write to different files and can therefore run at the same time.
+subdivide one numbered deliverable; their explicit dependencies and **Owns** entries determine
+whether they run in parallel (`M1-T3a/b/c`) or in sequence (`M4-T4a/b`).
 
 **Two ways to read this:**
 
@@ -28,11 +28,14 @@ write to different files and can therefore run at the same time.
 
 These apply to every task and are not repeated in the task bodies.
 
-1. **One task, one branch, one PR.** Branch from the merge of your dependencies, not from
-   an unrelated task's branch.
+1. **One task, one workspace branch; one integration PR per cohesive code wave.** Task branches
+   start from the merged dependency wave. The wave integrator combines completed code-task commits,
+   runs milestone-level checks, and opens one cohesive PR. Human-gated data lanes use separate PRs
+   after their human evidence is complete, so they do not hold unrelated code. `M3-T1` may ship as
+   its own early PR because it is an independently releasable production fix.
 2. **A task may only edit files in its Owns list.** If you need a change in someone else's file,
-   that is a signal the breakdown is wrong — raise it rather than reaching across. The one
-   exception is adding a new file that nobody owns.
+   that is a signal the breakdown is wrong — raise it rather than reaching across. New files must
+   be added to the ownership table before they are created.
 3. **`make check` must be green before hand-off.** It runs `format-check`, `lint`, `typecheck`,
    `test`, and the pre-push hook runs it anyway.
 4. **New modules under `src/` and `scripts/` need docstrings** (ruff `D100`–`D103`, `D107`) and
@@ -47,20 +50,25 @@ These apply to every task and are not repeated in the task bodies.
    `tests/test_models.py` guards it.
 8. **Everything is network-free by default.** Real-model work sits behind the `ollama` marker,
    deselected in `addopts`.
+9. **Human assertions are never synthesized by agents.** Agents may prepare unverified dataset
+   candidates and calibration templates, but only the named human owner may set
+   `label_verified=true`, screen judge-calibration classes, enter either independent rating, or
+   adjudicate them. Tasks with a human checkpoint remain blocked until that evidence exists.
+   Agent-authored cases use `source="generated"` and record `generated_by`; only human-authored
+   cases may use `source="handwritten"`.
 
 ---
 
-## Deviations from `plan.md`
+## Structural refinements
 
-Four structural changes, each made to remove a single-owner bottleneck. Reject any of them
-individually; the milestone shape survives either way.
+These four refinements remove single-owner bottlenecks and are now reflected in `plan.md`.
 
-| # | Deviation | Rationale |
+| # | Refinement | Rationale |
 |---|---|---|
-| 1 | The dataset loader accepts a **directory of `*.jsonl` shards** (`evals/data/tickets/`), not only a single `evals/data/tickets.jsonl` | This is the biggest unlock in the document. Case authoring is the long pole in both M1 and M4, and a single file serialises it. With shards, three people write `easy.jsonl`, `ambiguous.jsonl`, and `adversarial.jsonl` concurrently. Duplicate-ID detection still runs across the union, so nothing in the labelling contract weakens. |
-| 2 | `agent/ollama.py` is split three ways: prompts and schemas → `agent/prompts.py`, the response cache → `eval/cache.py`, preflight probing → `eval/preflight.py` | `plan.md` co-locates all of these "because `ollama.py` is the only module that knows about model calls". That argument is about coupling, and coupling is preserved: cache and preflight take the client as a parameter and know nothing about HTTP. What changes is that M3 becomes four parallel tasks instead of one 600-line file with one owner. |
-| 3 | Two modules `plan.md` never names get their own files: `eval/profiles.py` (run profiles + manifest assembly) and `eval/invariants.py` (system-invariant checks) | Without a home they would land in `runner.py` and `report.py`, making those files three-owner. |
-| 4 | `eval/statistics.py` must not import `eval/records.py`; it operates on primitive sequences of `(cluster_id, value)` | Removes a dependency edge (`M1-T6` no longer waits on `M1-T4`) and keeps the numerical code — the code `plan.md` itself flags as "most likely to be subtly wrong" — testable without constructing workflow records. |
+| 1 | The dataset loader accepts a directory of `*.jsonl` shards under `evals/data/tickets/` | Human-owned data tasks can progress independently while duplicate-ID detection still runs across the union. |
+| 2 | Prompts and schemas → `agent/prompts.py`, response cache → `eval/cache.py`, preflight → `eval/preflight.py` | Cache and preflight expose narrow interfaces and know nothing about HTTP. `agent/ollama.py` remains the only module that sends model requests, and its cache dependency is explicit. |
+| 3 | Run profiles → `eval/profiles.py`; invariant checks → `eval/invariants.py` | The responsibilities have named homes instead of turning `runner.py` and `report.py` into multi-owner bottlenecks. |
+| 4 | `eval/statistics.py` operates on primitive `(cluster_id, value)` sequences and does not import `eval/records.py` | Numerical code stays independently testable and no longer waits on record models. |
 
 ### One gotcha and one ambiguity
 
@@ -74,6 +82,36 @@ images are unaffected because they install runtime dependencies only. Resolved i
 `statistics.py` in milestone 1; the milestone 4 deliverables list "Threshold sweep and confidence
 diagnostics". Resolution used here: the pure sweep *function* lands in `M1-T6`, its *rendering and
 preflight gating* land in `M4-T3`. Both readings are satisfied.
+
+---
+
+## Locked cross-task interfaces
+
+These contracts are defined before parallel work starts. A task may add private details but may not
+change these names or semantics without updating its dependants and this document.
+
+- **Identity:** `EvalCase.id` is `case_key`. Runtime ticket and workflow IDs remain unique per run,
+  policy, case, and repeat. `RuntimeIdentityMap` resolves runtime ticket ID → `case_key`; only
+  `case_key` participates in tunable hashing, pairing, and cache identity.
+- **Event join:** every `CallEvent` stores separate `run_id`, `policy`, `case_key`, `repeat_index`,
+  and runtime `ticket_id`; together they join unambiguously to one `CaseRecord`.
+- **Scoring:** `prediction_available` is exactly `draft is not None`.
+  `terminal_outcome` independently records `resolved`, `rejected`, `escalated`,
+  `update_rejected`, or `runner_deadline_exceeded`.
+- **Workflow configuration:** `WorkflowEvalConfig` carries confidence threshold, primary and
+  fallback queues, schedule-to-start seconds, activity-timeout seconds, and heartbeat-timeout
+  seconds. The harness applies and snapshots all six values before workers start.
+- **Cache:** `ResponseCache.get(CacheRequest) -> CachedAgentResponse | None` and
+  `ResponseCache.put_success(CacheRequest, CachedAgentResponse) -> None`. `CacheRequest` includes
+  stable case content and generation configuration but excludes runtime ticket ID.
+- **Seeds:** `--seed` is the run seed and defaults to `0`; generation seeds derive from
+  `SHA-256(run_seed, case_key, repeat_index)` and stay equal across reviewer policies.
+  `--bootstrap-seed` is independent and defaults to `0`.
+- **Dataset validation:** `load_cases(..., require_verified=False)` is the authoring/shard check;
+  the default verified load plus `validate_dataset` is the release check. Default complete-dataset
+  ranges are easy 30–50%, ambiguous 30–50%, adversarial 15–35%, and each `reference_category`
+  15–35%. `reference_category` must belong to `acceptable_categories`; only it feeds category
+  distribution, precision, recall, F1, and confusion-matrix cells.
 
 ---
 
@@ -119,52 +157,61 @@ leaving `evals/data/` committed. Create the empty `eval/` and `eval/scorers/` pa
 
 ### M1-T2 — Dataset models and loader
 
-Implement `ExpectedOutcome` and `EvalCase` exactly as specified in `plan.md`'s "Evaluation contract"
-section, and a loader that reads either a single `.jsonl` file or a directory of `*.jsonl` shards
-(deviation 1), merging them into one case list. The loader enforces the seven rejection rules from
-`plan.md`: duplicate IDs across all shards, empty acceptable-category or acceptable-action sets,
-`label_verified=false`, refund labels without an amount, refund amounts absent from the ticket text,
-generated cases without `generated_by`, and tier or category balance outside a configured tolerance.
-Every rejection names the offending case ID and shard.
+Implement `ExpectedOutcome` and `EvalCase` exactly as specified in `plan.md`, including named
+verification metadata. `load_cases` reads either a single `.jsonl` file or a directory of shards and
+performs structural validation; `require_verified=False` permits an agent to validate draft shards
+without asserting human approval. `validate_dataset` separately applies the complete-union
+difficulty and category ranges from the locked interface. Refund-token parsing uses the exact
+currency and decimal rules in `plan.md`. Every rejection names the offending case ID and shard.
 
 **Acceptance**
 
-- Each rejection rule has a test that asserts on the error message, not just the exception type.
+- Each structural and distribution rejection rule has a test that asserts on the error message, not
+  just the exception type.
 - Two shards sharing a case ID are rejected.
 - A directory and an equivalent single file load to identical case lists.
-- Balance tolerance is configurable and its default is stated in the module docstring.
+- Each individual difficulty shard passes structural authoring validation without whole-dataset
+  balance checks.
+- Missing authors, self-verification, and a `generated_by` value on handwritten cases are rejected
+  with the offending ID.
+- A reference category outside the acceptable set is rejected.
+- The default whole-dataset percentage ranges are asserted exactly.
 
 ### M1-T3a — Labelling guide and easy cases
 
 Write `evals/data/labeling.md` documenting the labelling policy from `plan.md` — when a refund is
 expected, how multiple acceptable outcomes are recorded, what verification means — with worked
-positive, negative, ambiguous, and adversarial examples. Then author 20 `difficulty="easy"` cases:
-tickets whose category and action are unambiguous to a careful human.
+positive, negative, ambiguous, and adversarial examples. Then pause for a named human author to
+write 20 `difficulty="easy"` cases whose category and action are unambiguous. A different named
+human supplies `verified_by` and `verified_at` and changes `label_verified` to true. Agents may
+validate and format the completed shard but may not author cases labelled `source="handwritten"`.
 
 **Acceptance**
 
-- `uv run python scripts/eval.py dataset-check` passes on the shard (or the loader accepts it
-  directly if T8 has not landed).
-- All 20 cases have `label_verified=true` and `source="handwritten"`.
+- The human-authored draft passes `load_cases(easy_path, require_verified=False)` before review.
+- After the second-human checkpoint, all 20 cases have distinct `authored_by` and `verified_by`,
+  `verified_at`, `label_verified=true`, and `source="handwritten"`.
 - Categories are spread across all four `TicketCategory` values.
 - Every guide rule is illustrated by at least one committed case, referenced by ID.
 
 ### M1-T3b — Ambiguous cases
 
-Author 20 `difficulty="ambiguous"` cases — tickets where a competent agent could reasonably choose
-more than one category or action, recorded with multiple acceptable values rather than one
-arbitrary "right" answer. These are the cases that make `gate_recall` meaningful, so bias them
-toward outcomes near the confidence threshold rather than toward exotic phrasing.
+A named human writes 20 `difficulty="ambiguous"` cases — tickets where a competent agent could
+reasonably choose more than one category or action, recorded with multiple acceptable values rather
+than one arbitrary "right" answer. These are the cases that make `gate_recall` meaningful, so bias
+them toward outcomes near the confidence threshold rather than toward exotic phrasing.
 
 **Acceptance**
 
 - At least 12 cases carry more than one acceptable category or action.
 - Each case's `notes` field explains *why* it is ambiguous.
 - No case is ambiguous merely because it is badly written; ambiguity is about the support decision.
+- A second named human verifies every case before the task completes; agents only validate and
+  format the shard.
 
 ### M1-T3c — Adversarial cases
 
-Author 10 `difficulty="adversarial"` cases: prompt-injection attempts, refund requests with no
+A named human writes 10 `difficulty="adversarial"` cases: prompt-injection attempts, refund requests with no
 stated amount, refund requests for amounts not in the ticket, contradictory instructions, and
 tickets that describe a refund without requesting one. These exist to probe the refund rule and the
 gate, not to be unanswerable.
@@ -174,20 +221,25 @@ gate, not to be unanswerable.
 - At least three cases request a refund in a way that must *not* produce a `REFUND` action.
 - At least one case attempts to instruct the agent directly.
 - Each case's `notes` states the failure mode it targets.
+- A second named human verifies every case before the task completes; agents only validate and
+  format the shard.
 
 ### M1-T4 — Immutable record models
 
 Implement `CaseRecord`, `CallEvent`, and `RunManifest` per `plan.md`'s "Run artifacts and
 reproducibility" and "Telemetry" sections, plus JSONL read/write helpers that write atomically
-(temp file, then rename) and refuse to overwrite an existing raw artifact. `CaseRecord` must carry
-the scorability reason as a closed set — escalated, invalid output, update rejected, or runner
-deadline exceeded — so `M1-T5` can partition on it rather than on a free-text string.
+(temp file, then rename) and refuse to overwrite an existing raw artifact.
+`CaseRecord.prediction_available` is derived solely from draft presence. Keep execution state
+separate in the closed `terminal_outcome` set and record deadline cleanup independently, so
+post-draft update failures and deadlines remain structurally scorable.
 
 **Acceptance**
 
 - Writing to an existing `records.jsonl` or `calls.jsonl` path raises rather than truncating.
 - A partially written file is never left behind when the writer is interrupted.
 - Round-tripping a record through JSONL preserves every field, including enum types.
+- Records with the same draft but different terminal outcomes have the same
+  `prediction_available=true`.
 - `RunManifest` has a field for each bullet in `plan.md`'s manifest list; fields not yet knowable
   (model digests, preflight measurements) are optional and land in `M3-T6`.
 
@@ -201,20 +253,27 @@ in. Every returned metric carries its denominator as data, not as a comment, so 
 mislabel it. Include `gate_recall`, `gate_precision`, the category confusion matrix, action
 accuracy, and refund-amount error.
 
+Category correctness remains set-valued, while category distribution and per-class metrics use the
+single locked `reference_category`; tests cover a prediction accepted by the set that differs from
+the reference category.
+
 **Acceptance**
 
 - A synthetic record set with hand-computed metrics reproduces them exactly.
-- Escalated and invalid-output cases are absent from every quality denominator and present in their
-  own rates.
+- Cases without a draft are absent from quality denominators. A repaired case with a draft remains
+  scored even when one or more attempts were invalid.
+- `invalid_output_rate` counts cases with at least one invalid-output event over all cases; it does
+  not count invalid attempts or only exhausted repairs.
 - `gate_recall` and `gate_precision` are byte-identical when computed over oracle records and over
   rubber-stamp records built from the same agent outputs.
 - No metric can be constructed without a denominator label.
 
 ### M1-T6 — Statistics primitives
 
-Implement case-clustered percentile bootstrap intervals (5,000 resamples, seeded from the manifest,
-95%), paired effect size with interval, the exact McNemar test, and the threshold-sweep function.
-Per deviation 4, this module takes primitive sequences — `(case_id, value)` pairs — and does not
+Implement case-clustered percentile bootstrap intervals (5,000 resamples, seeded by
+`bootstrap_seed`, 95%), paired effect size with interval, the exact McNemar test, and the
+threshold-sweep function.
+Per structural refinement 4, this module takes primitive sequences — `(case_id, value)` pairs — and does not
 import `records.py`. Resampling draws *cases* and keeps all repeats of each drawn case, so repeats
 never inflate apparent precision.
 
@@ -232,7 +291,7 @@ never inflate apparent precision.
 
 Render the deterministic metrics to Markdown and to console. Every rate prints with its interval and
 its denominator name. Escalation and invalid-output rates render in a visually separate block from
-quality metrics. A run whose scored population is under ~100 cases is labelled *directional only* in
+quality metrics. A run whose scored population is less than 100 is labelled *directional only* in
 the header, and the scored population size prints beside the total with a per-reason exclusion
 breakdown.
 
@@ -240,19 +299,23 @@ breakdown.
 
 - A golden-file test pins the Markdown for a fixed synthetic record set.
 - No rate can render without an interval and a denominator.
-- The directional-only banner appears at N≈50 and disappears at N≈200.
+- The directional-only banner appears at scored N=99 and disappears at scored N=100.
 - Threshold-sweep and judge sections are absent — they arrive in M4.
 
 ### M1-T8 — `dataset-check` CLI
 
-Create `scripts/eval.py` with a subcommand structure that later milestones extend, implementing
-`dataset-check` first: load the dataset, print composition by difficulty, source, and category, and
-exit non-zero with an actionable message on any validation failure. Add `make eval-dataset-check`.
+Create `scripts/eval.py` with a subcommand structure that later milestones extend. `dataset-check`
+defaults to verified structural plus whole-dataset validation; `--shard PATH` performs structural
+validation only, and `--allow-unverified` sets `require_verified=false` for authoring. Print
+composition by difficulty, source, and category and exit non-zero with an actionable message on any
+validation failure. Add `make eval-dataset-check`.
 
 **Acceptance**
 
 - `make eval-dataset-check` exits 0 on the committed dataset and non-zero on a deliberately broken
   shard, printing the offending case ID.
+- Before the human-authored dataset PR lands, equivalent fixture-based CLI tests pass; the wave
+  integrator runs the committed-dataset command when closing milestone 1.
 - The subcommand structure accommodates `run`, `judge`, `report`, and `compare` without rework.
 - The script satisfies ruff's docstring rules (`scripts/` is not exempt).
 
@@ -267,7 +330,8 @@ T1 ──┬─> T2 ──┬─> T3a
      └─> T6 ─────────┴─> T7
 ```
 
-**Waves:** `[T1]` → `[T2, T4, T6]` → `[T3a, T3b, T3c, T5, T8]` → `[T7]`
+**Waves:** `[T1]` → `[T2, T4, T6]` → code lane `[T5, T8]`, human-data lane
+`[T3a, T3b, T3c]` → `[T7]`. Milestone 1 closes only after both lanes merge.
 
 **Serial order:** T1, T2, T8, T3a, T3b, T3c, T4, T5, T6, T7. Doing T8 before the authoring tasks
 gives you `dataset-check` as a validation loop while writing cases.
@@ -281,29 +345,31 @@ chose in advance, so the harness itself can be proven correct before any real mo
 
 | ID | Goal | Depends on | Owns |
 |---|---|---|---|
-| M2-T1 | Tunable mock agent | M1-T2 | `src/ticketflow/agent/tunable.py`, `tests/eval/test_tunable_agent.py` |
+| M2-T1 | Tunable mock agent | M1-T2, T6 | `src/ticketflow/agent/tunable.py`, `tests/eval/test_tunable_agent.py` |
 | M2-T2 | Temporal harness | M1-T1 | `src/ticketflow/eval/harness.py`, `tests/helpers.py`, `tests/eval/test_harness.py` |
 | M2-T3 | Reviewer policies | M1-T5 | `src/ticketflow/eval/reviewers.py`, `tests/eval/test_reviewers.py` |
-| M2-T4 | Per-case runner | T2, T3, M1-T4 | `src/ticketflow/eval/runner.py`, `tests/eval/test_runner.py` |
-| M2-T5 | Run profiles and manifest | T4 | `src/ticketflow/eval/profiles.py`, `tests/eval/test_profiles.py` |
-| M2-T6 | Telemetry sink and invariants | M1-T4 | `src/ticketflow/eval/telemetry.py`, `src/ticketflow/eval/invariants.py`, `tests/eval/test_invariants.py` |
-| M2-T7 | `run` CLI subcommand | T5 | `scripts/eval.py`, `Makefile` |
-| M2-T8 | Cross-cutting workflow suite | T5 | `tests/eval/test_runner_workflow.py` |
+| M2-T4 | Per-case runner | T2, T3, T6, M1-T4 | `src/ticketflow/eval/runner.py`, `tests/eval/test_runner.py`, `src/ticketflow/readmodel.py`, `tests/test_readmodel.py` |
+| M2-T5 | Run profiles and manifest | T1, T4, T6 | `src/ticketflow/eval/profiles.py`, `tests/eval/test_profiles.py` |
+| M2-T6 | Identity, telemetry, and invariants | M1-T4 | `src/ticketflow/eval/telemetry.py`, `src/ticketflow/eval/invariants.py`, `tests/eval/test_telemetry.py`, `tests/eval/test_invariants.py` |
+| M2-T7 | `run` CLI subcommand | T5 | `scripts/eval.py`, `Makefile`, `tests/eval/test_eval_cli.py` |
+| M2-T8 | Cross-cutting workflow suite | T1, T5, T6 | `tests/eval/test_runner_workflow.py` |
 
 ### M2-T1 — Tunable mock agent
 
-Build `TunableMockAgent`, which derives every decision from a stable hash of
-`(seed, ticket.id, operation)` rather than from a shared mutable RNG like `MockAgent` does. Because
-it must be able to be *deliberately wrong*, it takes the expected-outcome map from the dataset and
-starts from the correct answer, perturbing it according to its profile: category, action, and
-refund-amount error rates *or* exact error ID sets; confidence calibration and overconfidence; a
-transient failure rate *or* exact failure ID set; and the `primary`/`fallback` role label.
+Build `TunableMockAgent`, which resolves runtime ticket IDs through `RuntimeIdentityMap` and derives
+every decision from `(generation_seed, case_key, operation)` rather than from a shared mutable RNG.
+It takes the expected-outcome map keyed by `case_key` and starts from the correct answer, perturbing
+it according to its profile: category, action, and refund-amount error rates or exact error ID sets;
+confidence calibration and overconfidence; transient failure rate or exact failure ID set; and the
+`primary`/`fallback` role label. It emits attempts through the `M2-T6` telemetry sink.
 
 **Acceptance**
 
 - The same seed and case produce the same output regardless of concurrency, case ordering, or how
   many other cases ran first — asserted by running a case set forwards, backwards, and with
   concurrency 8, and comparing.
+- Different runtime ticket IDs for oracle and rubber-stamp resolve to the same `case_key` and
+  produce byte-identical outputs for the same repeat.
 - An exact error ID set produces exactly those errors and no others, so downstream metric tests are
   not probabilistic.
 - The role label reaches `Classification.model` and `DraftReply.model` so `_model_path()` reports
@@ -319,7 +385,8 @@ queues** (today `make_worker` hosts one agent queue); register the `TicketStatus
 attribute for both the time-skipping and the local server, since every status transition upserts it
 and the workflow task fails otherwise; use `pydantic_data_converter` on the client; patch and
 snapshot the workflow module constants (`CONFIDENCE_THRESHOLD`, `AGENT_TASK_QUEUE`,
-`FALLBACK_TASK_QUEUE`, `AGENT_SCHEDULE_TO_START_S`) before workers start, using
+`FALLBACK_TASK_QUEUE`, `AGENT_SCHEDULE_TO_START_S`, `AGENT_ACTIVITY_TIMEOUT`, and
+`AGENT_HEARTBEAT_TIMEOUT`) before workers start, using
 `UnsandboxedWorkflowRunner` so the patch is visible inside the sandbox; and scope the worker
 lifecycle to the **run**, not the case, because post-completion queries are served by replaying
 history on a live worker.
@@ -330,6 +397,7 @@ history on a live worker.
 - A workflow can be queried after it has completed, with workers still up.
 - Primary and fallback agents can be different objects on different queues in the same run.
 - The snapshot of workflow constants is returned as data for the manifest, not just applied.
+- A preflight-adjusted activity timeout reaches both primary and fallback activity options.
 - Both time-skipping and local-server modes are exercised.
 
 ### M2-T3 — Reviewer policies
@@ -355,16 +423,21 @@ of the risk. Approval is a workflow **update** with a validator, so the runner m
 `WorkflowUpdateFailedError` — recorded as a case outcome, never fatal to the run. The fallback
 activity is dispatched with no schedule-to-start timeout and the workflow has no run timeout, so a
 missing fallback worker parks forever; the runner imposes its own wall-clock deadline per case and
-records a `timeout` outcome. And post-completion state comes from the `status` query, whose `result`
+records `runner_deadline_exceeded`, requests cancellation, waits five seconds, and terminates if
+cancellation is not confirmed. Post-completion state comes from the `status` query, whose `result`
 field the workflow never populates and which must not be read — the terminal `TicketResult` comes
-from awaiting the handle. Finish by capturing refund and refund-attempt rows and emitting one
-`CaseRecord` plus its `CallEvent`s.
+from awaiting the handle. Add `RefundObservation` and
+`get_refund_observation(ticket_id, db_path=None) -> RefundObservation` to the read model; the runner
+does not issue raw SQLite queries. Finish by emitting one `CaseRecord` plus its `CallEvent`s.
 
 **Acceptance**
 
 - A rejected approval update is recorded as a case outcome and the run continues.
-- A case that exceeds its deadline is recorded as `timeout` and the run continues.
+- A case that exceeds its deadline records the best-effort status, is cancelled or terminated,
+  records the cleanup action, and does not remain open after the run.
+- A post-draft deadline remains `prediction_available=true`.
 - Classification, draft, and decision are captured for every completed case.
+- Refund observation uses tested public read-model helpers.
 - Nothing reads `TicketStatusInfo.result`.
 - Bounded concurrency is configurable and results do not depend on it.
 
@@ -377,7 +450,8 @@ experiment*: it hosts a worker only on the fallback queue, withholds the primary
 real schedule-to-start timeout, runs under time skipping over a small subset, and its results are
 excluded from model-quality headlines. `reliability` runs with oracle only, cache disabled, and full
 call telemetry. Assemble the manifest with the git commit and dirty state, dataset SHA-256, workflow
-constant snapshot, reviewer policies and their order, seed, concurrency, and repeats.
+constant snapshot, reviewer policies and their order, run seed, bootstrap seed, derived-generation
+seed rule, concurrency, and repeats.
 
 **Acceptance**
 
@@ -385,13 +459,16 @@ constant snapshot, reviewer policies and their order, seed, concurrency, and rep
   case, proving time skipping is actually in play.
 - Routing records identify the fallback path and are excluded from quality comparisons.
 - The manifest records dirty state truthfully on a dirty tree.
-- `--repeats > 1` is rejected with the cache enabled, or with a fixed seed at `temperature=0`.
+- `--repeats > 1` is rejected with the cache enabled.
+- A fixed run seed derives distinct repeat seeds while remaining identical across reviewer policies.
 
-### M2-T6 — Telemetry sink and invariants
+### M2-T6 — Identity, telemetry, and invariants
 
-Provide a process-local `CallEvent` sink that agents write to and the runner drains per case — the
-harness is single-process, so a module-level collector is sufficient and simpler than threading a
-handle through the activity boundary. Separately, implement the system-invariant checks from
+Provide `RuntimeIdentityMap.register(ticket_id, case_key)`/`resolve(ticket_id)` and a process-local
+`CallEvent` sink keyed by runtime ticket ID and operation. Agents write attempts to it and the
+runner drains them into events containing separate `run_id`, `policy`, `case_key`, `repeat_index`,
+and `ticket_id`. Both services are concurrency-safe and run-scoped; no parser infers metadata from
+delimiters inside a ticket ID. Separately, implement the system-invariant checks from
 `plan.md`'s reporting section: gating agrees with the recorded threshold and refund rule, at most
 one refund row per ticket, refund attempts ≥ executed refunds, an executed refund implies an
 approved decision, and a fallback-routing record identifies the fallback path.
@@ -399,6 +476,8 @@ approved decision, and a fallback-routing record identifies the fallback path.
 **Acceptance**
 
 - Events from concurrent cases are attributed to the right case.
+- Repeats and reviewer policies produce distinct event join keys without changing `case_key`.
+- Oracle and rubber-stamp runtime IDs resolve to the same stable `case_key`.
 - Each invariant has a test that constructs a violating record set and asserts it is flagged.
 - Violations are reported as data, not raised — a violated invariant is a finding, not a crash.
 - `model_path` is not used as a retry counter anywhere.
@@ -408,13 +487,15 @@ approved decision, and a fallback-routing record identifies the fallback path.
 Extend `scripts/eval.py` with `run --profile primary-quality|fallback-quality|fallback-routing|
 reliability` and the option set from `plan.md`: `--agent`, `--reviewer`, `--limit`, `--repeats`,
 `--concurrency`, `--seed`, `--no-cache`. Enforce that `--repeats > 1` implies `--no-cache` and a
-varied or absent seed. Add a `make eval` target for the fast tunable profile.
+different derived generation seed per repeat. Add `--bootstrap-seed`, defaulting to `0`, and a
+`make eval` target for the fast tunable profile.
 
 **Acceptance**
 
 - `make eval` completes a full tunable run over the committed dataset with no Temporal server or
   Ollama installed beyond the test server.
 - Invalid option combinations fail before any workflow starts, with a message explaining why.
+- CLI option parsing and validation are covered in `tests/eval/test_eval_cli.py`.
 - Run artifacts land under `evals/runs/<run_id>/` and are gitignored.
 
 ### M2-T8 — Cross-cutting workflow suite
@@ -435,13 +516,14 @@ deadline, retry telemetry, refund idempotency, and concurrency-independence of r
 **DAG**
 
 ```
-M1 ──┬─> T1
-     ├─> T2 ──┐
-     ├─> T3 ──┼─> T4 ──> T5 ──┬─> T7
-     └─> T6 ──┘               └─> T8
+M1 ──┬────────> T2 ──┐
+     ├────────> T3 ──┤
+     └─> T6 ──┬──────┴─> T4 ──┐
+              └─> T1 ─────────┴─> T5 ──┬─> T7
+                                       └─> T8
 ```
 
-**Waves:** `[T1, T2, T3, T6]` → `[T4]` → `[T5]` → `[T7, T8]`
+**Waves:** `[T2, T3, T6]` → `[T1, T4]` → `[T5]` → `[T7, T8]`
 
 **Serial order:** T2, T3, T6, T1, T4, T5, T8, T7.
 
@@ -456,11 +538,11 @@ output masquerade as a quality signal.
 |---|---|---|---|
 | M3-T1 | Periodic activity heartbeats *(production change)* | — | `src/ticketflow/activities.py`, `tests/test_activities.py`, `docs/context.md` |
 | M3-T2 | Prompts and schemas | M1-T1 | `src/ticketflow/agent/prompts.py`, `tests/eval/test_prompts.py` |
-| M3-T3 | Ollama agent | T2, M2-T6 | `src/ticketflow/agent/ollama.py`, `tests/eval/test_ollama_agent.py` |
+| M3-T3 | Ollama agent | T2, T4, M2-T6 | `src/ticketflow/agent/ollama.py`, `tests/eval/test_ollama_agent.py` |
 | M3-T4 | Response cache | T2 | `src/ticketflow/eval/cache.py`, `tests/eval/test_cache.py` |
 | M3-T5 | Preflight | T3 | `src/ticketflow/eval/preflight.py`, `tests/eval/test_preflight.py` |
 | M3-T6 | Manifest enrichment | T3, T5 | `src/ticketflow/eval/records.py`, `src/ticketflow/eval/profiles.py` |
-| M3-T7 | Ollama CLI wiring | T3, T4, T5 | `scripts/eval.py`, `Makefile` |
+| M3-T7 | Production factory and Ollama CLI wiring | T3, T5, T6 | `src/ticketflow/agent/factory.py`, `src/ticketflow/config.py`, `src/ticketflow/llm_worker.py`, `tests/test_config.py`, `tests/test_llm_worker.py`, `scripts/eval.py`, `Makefile` |
 | M3-T8 | Local smoke run | T1, T7 | `tests/eval/test_ollama_smoke.py` |
 
 ### M3-T1 — Periodic activity heartbeats
@@ -468,13 +550,15 @@ output masquerade as a quality signal.
 The one production change in scope, and already an accepted follow-up in `docs/context.md`. Both
 agent activities currently heartbeat only immediately before and after the agent call, so with
 `heartbeat_timeout=30s` any real LLM call slower than 30 seconds is killed mid-flight. Wrap the
-agent call in a background asyncio task that heartbeats roughly every 10 seconds and is cancelled
-when the call returns or raises. Close the follow-up entry in the decision log.
+agent call in a reusable background heartbeat helper whose production interval is 10 seconds and
+whose test interval is injectable. Cancel and await the heartbeat task when the call returns or
+raises. Close the follow-up entry in the decision log.
 
 **Acceptance**
 
-- An agent call artificially slowed past 30 seconds completes rather than timing out.
-- The existing test suite stays instant — the default mock latency is 0 and nothing sleeps.
+- A unit test using a 10-millisecond heartbeat interval observes multiple heartbeats during a short
+  artificial call; no default test sleeps for 30 seconds.
+- The local Ollama smoke run supplies the real-time long-call integration check.
 - Heartbeat cancellation happens on the error path too, verified for both agent error classes.
 - This task has no dependencies and can be pulled forward to run alongside milestone 1.
 
@@ -495,7 +579,9 @@ is assigned by application code after Pydantic validation, never trusted from th
 
 Implement the real agent over a shared, lifecycle-managed `httpx.AsyncClient` calling
 `POST /api/chat` with `stream=false`, `think=false`, `temperature=0`, a configurable seed and
-timeout, and the schema in `format`. Map errors deliberately: connection failures, HTTP timeouts,
+timeout, and the schema in `format`. It consumes `M3-T4`'s exact `ResponseCache` interface: look up
+before HTTP, emit cache-hit telemetry on a hit, and store only a successfully validated response.
+Map errors deliberately: connection failures, HTTP timeouts,
 408, 429, and 5xx become `AgentOverloadedError`; 400 and model-not-found become
 `AgentPermanentError`. `AgentOverloadedError` is left unmapped at the activity layer on purpose so
 it escapes as a generic retryable activity failure into the workflow's own retry loop — it must not
@@ -517,31 +603,36 @@ outcome `invalid_output` is a first-class `CallEvent` outcome, and only an exhau
 - A schema-invalid response is re-asked exactly once; a second failure raises
   `AgentPermanentError`; a refund missing its amount does *not* escalate on the first attempt.
 - `invalid_output` events reach the telemetry sink with both attempt numbers.
+- The second reviewer policy is 100% cache hits and receives byte-identical outputs for the same
+  case and repeat despite different runtime ticket IDs.
+- Failed and invalid-output calls never invoke `put_success`.
 - No stub test performs real network I/O, and the suite is collected by default.
 
 ### M3-T4 — Response cache
 
-Cache successful responses only. The key hashes the complete normalized request: operation, model
-name and digest, role, ticket content, the classification input when drafting, messages and prompt
-version, JSON schema, think setting, temperature, seed, generation options, and the Ollama version.
-Entries store request metadata for inspection and are written atomically. This is what lets the
-oracle and rubber-stamp policy runs receive byte-identical agent outputs — the whole
-reviewer-comparison design depends on it.
+Implement the locked `ResponseCache`, `CacheRequest`, and `CachedAgentResponse` interface. The key
+hashes operation, model name and digest, role, stable `case_key`, customer email, subject, body, the
+classification input when drafting, messages and prompt version, JSON schema, think setting,
+temperature, derived generation seed, generation options, and the Ollama version. It explicitly
+excludes runtime ticket ID. Entries store request metadata for inspection and are written
+atomically.
 
 **Acceptance**
 
 - A test per key component proves that changing it alone invalidates the entry.
-- Failed and invalid-output calls are never cached.
-- A second policy run over the same records is 100% cache hits and produces byte-identical outputs.
-- Cache-hit calls are marked as such so they can be excluded from latency statistics.
+- The cache exposes no generic write method: only `put_success` exists.
+- Requests differing only in runtime ticket ID have identical keys; requests differing in
+  `case_key` do not.
+- Atomic writes never expose a partial entry and never silently overwrite a different payload.
 
 ### M3-T5 — Preflight
 
 Before any real-model run: check `/api/version`, confirm every required model exists and record its
 digest, run one unmeasured warm-up, then measure at least three classifications and three drafts,
-separating model-load from generation time. Widen the effective activity timeout to the larger of
-the configured value or three times the slowest observed stage, set the HTTP timeout below it with a
-margin, and record every adjustment. Then probe ~10 cases for confidence variance and decide whether
+separating model-load from generation time. Return a new `WorkflowEvalConfig` whose activity timeout
+is `max(10 seconds, configured, 3 * slowest_stage)` and an HTTP timeout below it by
+`max(5 seconds, 10% of the activity timeout)`; record every adjustment. Then probe ~10 cases for
+confidence variance and decide whether
 the threshold sweep is admissible: it requires **both** a standard deviation of at least 0.02 **and**
 at least five distinct values. Standard deviation alone is too weak — self-reported LLM confidence
 typically clusters on two or three values like 0.9 and 0.95, which passes a variance threshold while
@@ -552,6 +643,8 @@ producing a step function with no interior operating points.
 - A synthetic confidence distribution of `{0.9, 0.95}` fails the distinctness gate despite passing
   variance, and the report names which gate failed.
 - Timeout widening is computed from measurements and recorded, not hardcoded.
+- The adjusted timeout reaches both primary and fallback workflow activity options through the
+  harness configuration interface.
 - A degenerate confidence distribution is reported as a finding, not an error.
 - A missing model fails preflight with the model name in the message, before any case runs.
 
@@ -561,7 +654,7 @@ Fill in the manifest fields that only become knowable once a real model is invol
 digests, Ollama, Python, and relevant dependency versions, prompt and schema hashes, generation
 options, preflight measurements, and every timeout adjustment. Enforce raw-artifact immutability
 end-to-end — `records.jsonl` and `calls.jsonl` are written once and never rewritten; re-judging
-creates a new file under `judgments/`.
+creates `judgments/<rubric_hash>-<judgment_id>.jsonl` and never overwrites a prior judgment.
 
 **Acceptance**
 
@@ -569,46 +662,49 @@ creates a new file under `judgments/`.
 - Attempting to re-run into an existing run directory fails rather than overwriting.
 - A report can be traced back to its source record and manifest hashes.
 
-### M3-T7 — Ollama CLI wiring
+### M3-T7 — Production factory and Ollama CLI wiring
 
-Extend `scripts/eval.py` with `--agent ollama`, model and endpoint overrides, and `--no-cache` (made
-mandatory for the reliability profile). Add `make eval-ollama`.
+Add `build_agent(role, settings, cache=None, event_sink=None)` and production settings for
+`TICKETFLOW_AGENT_BACKEND=mock|ollama` plus the exact Ollama environment keys and defaults in
+`plan.md`. Update `llm_worker.py` to construct both roles through the factory. Extend
+`scripts/eval.py` with `--agent ollama`, model and endpoint overrides, and `--no-cache` (mandatory
+for reliability). Add `make eval-ollama`.
 
 **Acceptance**
 
 - Primary and fallback quality profiles can be launched over the same limited case set from the CLI.
 - The reliability profile refuses to run with the cache enabled.
 - Model overrides reach the manifest.
+- The production worker defaults to the existing mock behavior and constructs Ollama agents when
+  configured; an invalid backend fails before workers start.
+- The production worker passes no eval cache or telemetry sink; eval profiles inject both.
 
 ### M3-T8 — Local smoke run
 
 A small end-to-end run against real Ollama, marked `ollama` and deselected by default. It runs the
 primary and fallback quality profiles over the same handful of cases and asserts the artifacts are
-well-formed. Critically, it unloads agent models with `keep_alive=0` between phases: the primary
-(23 GB) and the judge (17 GB) must never be resident simultaneously on the 64 GB machine.
+well-formed. It unloads the primary with `keep_alive=0` before the fallback phase and verifies model
+residency. The judge is not run in this milestone; `M4-T5` enforces the primary-versus-judge
+residency rule.
 
 **Acceptance**
 
 - Not collected by a bare `uv run pytest`; collected by `uv run pytest -m ollama -o addopts=`.
-- The degraded fallback model reports a measurable `invalid_output_rate` rather than escalating
-  every malformed refund — this is the headline evidence that `M3-T3`'s repair budget works.
+- Any observed real-model `invalid_output_rate` is reported diagnostically; a non-zero value is not
+  required from the small sample. Deterministic stub tests carry the repair-budget assertion.
 - Model residency is asserted, not assumed, between phases.
 - Requires `M3-T1`; without heartbeats a real call can be killed at 30 seconds.
 
 **DAG**
 
 ```
-T1 ─────────────────────────────────────────────┐
-                     ┌─> T6                      │
-T2 ──┬─> T3 ──> T5 ──┤                           │
-     │   │           └──┐                        │
-     │   └──────────────┼─> T7 ──────────────────┴─> T8
-     └─> T4 ────────────┘
+T1 ────────────────────────────────────────────────────────┐
+T2 ──> T4 ──> T3 ──> T5 ──> T6 ──> T7 ──────────────────┴─> T8
 ```
 
-**Waves:** `[T1, T2]` → `[T3, T4]` → `[T5, T6]` → `[T7]` → `[T8]`
+**Waves:** `[T1, T2]` → `[T4]` → `[T3]` → `[T5]` → `[T6]` → `[T7]` → `[T8]`
 
-**Serial order:** T1, T2, T3, T4, T5, T6, T7, T8.
+**Serial order:** T1, T2, T4, T3, T5, T6, T7, T8.
 
 ---
 
@@ -622,31 +718,33 @@ T2 ──┬─> T3 ──> T5 ──┤                           │
 | M4-T1a | Grow easy cases to 60 | M1-T3a | `evals/data/tickets/easy.jsonl` |
 | M4-T1b | Grow ambiguous cases to 80 | M1-T3b | `evals/data/tickets/ambiguous.jsonl` |
 | M4-T1c | Grow adversarial cases to 60 | M1-T3c | `evals/data/tickets/adversarial.jsonl` |
-| M4-T2 | Paired comparison and `compare` | M1-T6 | `src/ticketflow/eval/compare.py`, `scripts/eval.py` |
-| M4-T3 | Threshold sweep and confidence diagnostics | M1-T6, M3-T5 | `src/ticketflow/eval/report.py` |
-| M4-T4 | Judge calibration set | M3-T8 | `evals/data/judge_calibration.jsonl`, `evals/data/judging.md` |
-| M4-T5 | Offline judge | M3-T3 | `src/ticketflow/eval/scorers/judge.py`, `scripts/eval.py` |
-| M4-T6 | Calibration gates | M4-T4 | `src/ticketflow/eval/scorers/calibration.py`, `tests/eval/test_calibration.py` |
-| M4-T7 | Final report | T3, T5, T6 | `src/ticketflow/eval/report.py` |
+| M4-T2 | Paired comparison and `compare` | M1-T6 | `src/ticketflow/eval/compare.py`, `tests/eval/test_compare.py`, `scripts/eval.py`, `Makefile` |
+| M4-T3 | Threshold sweep and confidence diagnostics | M1-T6, M3-T5 | `src/ticketflow/eval/report.py`, `tests/eval/test_report.py` |
+| M4-T4a | Calibration source runs and bundle | M3-T8 | `evals/data/judge_calibration_sources/` |
+| M4-T4b | Human judge calibration set | T4a | `evals/data/judge_calibration.jsonl`, `evals/data/judging.md` |
+| M4-T5 | Offline judge | M3-T3, T2, T4b | `src/ticketflow/eval/scorers/judge.py`, `tests/eval/test_judge.py`, `scripts/eval.py`, `evals/data/judge_calibration_judgments/` |
+| M4-T6 | Calibration gates | M4-T4b, T5 | `src/ticketflow/eval/scorers/calibration.py`, `tests/eval/test_calibration.py` |
+| M4-T7 | Final report and `report` CLI | T1a, T1b, T1c, T2, T3, T5, T6 | `src/ticketflow/eval/report.py`, `tests/eval/test_report.py`, `scripts/eval.py` |
 
-> `report.py` is owned by both T3 and T7 and `scripts/eval.py` by both T2 and T5. T3 → T7 is an
-> explicit edge; T2 and T5 must be serialised even though no semantic dependency exists between
-> them. Take T2 first.
+> `report.py` and its test are owned by both T3 and T7; `scripts/eval.py` is owned by T2, T5, and
+> T7. The dependency table serialises every shared file explicitly.
 
 ### M4-T1a/b/c — Dataset growth to ~200 verified cases
 
-Grow each difficulty shard toward the milestone 4 target: 60 easy, 80 ambiguous, 60 adversarial.
-Generated cases are permitted but must record `generated_by`, must be human-verified before
-`label_verified=true`, and remain separately sliced in reports — generated data is systematically
-easier than real traffic and the reports must be able to show that. Three tasks, three shards, no
-shared file.
+Draft each difficulty shard toward the milestone 4 target: 60 easy, 80 ambiguous, 60 adversarial.
+Generated cases record `generated_by` and stay `label_verified=false` until a non-author human
+supplies `verified_by` and `verified_at`. Agents stop at that checkpoint and never flip the flag.
+After human verification, generated cases remain separately sliced in reports. Three tasks, three
+shards, no shared file.
 
 **Acceptance**
 
 - `make eval-dataset-check` passes on the union, including cross-shard duplicate-ID detection.
-- Every case is `label_verified=true`; every generated case has `generated_by` set.
+- Before human review, authoring-mode validation passes with unverified cases.
+- After the human checkpoint, every case has named verification and every generated case has
+  `generated_by` set.
 - The ambiguous tier remains the largest, matching `plan.md`'s target distribution.
-- Balance tolerance still passes without loosening it.
+- The fixed difficulty and category percentage ranges pass without override.
 
 ### M4-T2 — Paired comparison and `compare`
 
@@ -655,6 +753,7 @@ McNemar test as supporting evidence for binary correctness only. Flag a headline
 when the paired 95% interval excludes zero **and** the absolute degradation is at least five
 percentage points. Per-class, difficulty, and source slices are exploratory and labelled as such.
 Add the `compare --baseline --candidate` subcommand.
+Add `make eval-compare`.
 
 **Acceptance**
 
@@ -679,54 +778,95 @@ cases excluded for having no draft alongside the table.
 - The excluded no-draft count prints with the table.
 - The sweep is scoped to one policy's scored population, not pooled across policies.
 
-### M4-T4 — Judge calibration set
+### M4-T4a — Calibration source runs and bundle
 
-Assemble at least 30 stored replies spanning good, weak, irrelevant, and hallucinated outputs, score
-them independently with two humans, and adjudicate disagreements. Write the judging rubric alongside
-them. This is a data and process task, not a code task, and it gates every judge-derived number in
-the final report.
+Run at least 30 real cases through each of the primary-quality and fallback-quality profiles,
+producing at least 60 immutable stored replies. Publish a minimal committed bundle containing the
+ticket context and reply needed for judging in `judge_calibration_sources/replies.jsonl`, plus an
+`index.json` with each source run ID, its manifest and records SHA-256, and a content hash for every
+copied record. This copy-and-verify handoff is required because raw `evals/runs/` artifacts are
+gitignored and do not cross workspace branches. The handful-case M3 smoke run does not qualify by
+itself. Agents may diversify the pool using structured correctness, confidence, profile, and
+difficulty, but may not assert subjective output classes.
+
+**Acceptance**
+
+- The source index names primary-quality and fallback-quality runs with at least 30 cases each.
+- At publication time, every indexed run exists and its stored manifest and records match the
+  recorded hashes.
+- A clean workspace can verify every copied record from the committed bundle and its index without
+  access to the original gitignored run directories.
+- The committed pool contains at least 60 real replies selected with documented, non-authoritative
+  diversity proxies.
+
+### M4-T4b — Human judge calibration set
+
+From the qualifying source bundle, an agent prepares empty screening and rating columns plus the
+judging rubric, then pauses. A named human screens the candidate pool for good, weak, irrelevant,
+and hallucinated coverage. If all four classes cannot supply a sample of at least 30 replies, this
+task remains blocked while T4a publishes a larger verified bundle revision. Two named humans then
+score the selected replies independently without seeing the screening labels or each other's
+ratings, and a named human adjudicator records the final labels. Agents may validate the completed
+shape but may not enter or infer the screening class, a human rating, or the adjudication.
 
 **Acceptance**
 
 - ≥30 replies, drawn from real run artifacts rather than invented.
-- All four output classes are represented.
+- A named human screener confirms all four output classes are represented; screening labels remain
+  hidden from the independent raters.
 - Both independent score sets and the adjudicated result are recorded separately, so agreement can
   be computed rather than assumed.
+- Screener, rater, and adjudicator identities and timestamps are present; no human assertion is
+  agent-authored.
 - The rubric is specific enough that a third person reproduces the adjudicated labels.
 
 ### M4-T5 — Offline judge
 
 Score stored reply text on relevance (1–5), appropriate support tone (1–5), and hallucinated
 commitments (boolean), using the Gemma judge. This runs as a **separate phase** after workflow
-execution, with agent models unloaded first, and writes `judgments/<rubric_hash>.jsonl` — it never
-touches the raw records. Add the `judge --run-id` subcommand.
+execution. It calls `keep_alive=0` for agent models and verifies residency before loading Gemma,
+then writes `judgments/<rubric_hash>-<judgment_id>.jsonl`; it never touches raw records. Add the
+`judge --run-id` subcommand. Before judging production runs, use the same code and generation
+settings to score `judge_calibration.jsonl`, writing a versioned artifact under
+`evals/data/judge_calibration_judgments/`.
 
 **Acceptance**
 
-- Re-judging the same run writes a new file and leaves `records.jsonl` byte-identical.
-- The rubric hash appears in the filename and inside the artifact.
+- Re-judging the same run generates a new `judgment_id`, writes a new file, and leaves
+  `records.jsonl` byte-identical.
+- The rubric hash appears in the filename and inside the artifact together with judge identity,
+  generation options, and source record and manifest hashes.
+- Every completed human calibration item has exactly one Gemma prediction in the calibration
+  judgment artifact.
 - The judge never runs while an agent model is resident.
 
 ### M4-T6 — Calibration gates
 
-Compute weighted Cohen's κ for relevance and for tone, and κ plus F1 for hallucination, against the
-calibration set. Each dimension passes only at κ ≥ 0.60 (and F1 ≥ 0.80 for hallucination). Report
-agreement intervals and the calibration sample size. A failing dimension is suppressed
-**individually** — it must not suppress dimensions that passed.
+Compare Gemma's calibration predictions with the adjudicated human labels. Compute linearly
+weighted Cohen's κ for relevance and tone, and unweighted Cohen's κ plus F1 with hallucination as
+the positive class. Each dimension passes only at κ ≥ 0.60, with F1 ≥ 0.80 also required for
+hallucination. Separately compute the same agreement statistics between the two independent humans
+as rubric-quality evidence; those numbers never substitute for judge validation. Use a 5,000-sample
+percentile bootstrap over calibration replies with `bootstrap_seed` for 95% agreement intervals.
+Report intervals and sample size. A failing judge dimension is suppressed individually.
 
 **Acceptance**
 
 - A synthetic set with known κ reproduces it.
+- A judge that disagrees with adjudication fails even when human-human agreement is perfect.
 - Failing one dimension suppresses only that dimension.
-- The gate values and the sample size are reported as data beside every judge-derived metric.
+- Judge-versus-adjudicated gates, human-human evidence, and sample size are reported beside every
+  judge-derived metric.
 
-### M4-T7 — Final report
+### M4-T7 — Final report and `report` CLI
 
 Assemble the complete report: difficulty and source slices, invariant violations, primary-versus-
 fallback paired comparison, oracle-versus-rubber-stamp outcomes, and judge-derived metrics shown
 only for dimensions whose calibration gate passed, each printed beside its validation result. Judge
 numbers remain visibly secondary to the deterministic structured metrics — a different model family
-reduces obvious self-grading bias but does not make the judge ground truth.
+reduces obvious self-grading bias but does not make the judge ground truth. Add
+`report --run-id`; it reads immutable artifacts and writes or prints a derived report without
+rewriting raw inputs.
 
 **Acceptance**
 
@@ -735,24 +875,26 @@ reduces obvious self-grading bias but does not make the judge ground truth.
   explicitly that the model's confidence distribution cannot support threshold tuning.
 - Source slices show generated versus handwritten separately.
 - A golden-file test pins the full report for a fixed synthetic run.
+- `report --run-id` works without Temporal or Ollama and leaves raw artifact hashes unchanged.
 
 **DAG**
 
 ```
-T1a ─┐
-T1b ─┼─ (independent, no downstream edges)
-T1c ─┘
-T2 ──────────────────> T5 ──┐        (edge is file contention on scripts/eval.py)
-T3 ─────────────────────────┼─> T7   (edge is file contention on report.py)
-T4 ──────────> T6 ──────────┘
+T1a ───────────────────────────────┐
+T1b ───────────────────────────────┤
+T1c ───────────────────────────────┤
+T2 ───────> T5 ────────────────────┤
+T3 ────────────────────────────────┼─> T7
+T4a ──> T4b ──> T5 ──> T6 ────────┘
 ```
 
-**Waves:** `[T1a, T1b, T1c, T2, T3, T4]` → `[T5, T6]` → `[T7]`
+**Waves:** `[T1a, T1b, T1c, T2, T3, T4a]` → `[T4b]` → `[T5]` → `[T6]` → `[T7]`
 
-T2 → T5 and T3 → T7 are ordering edges forced by shared file ownership, not by semantics; if you
-split those files differently, both collapse into a single wave.
+The first wave contains human-gated data tasks. Its code tasks may finish while those gates are
+open. `T4b` is a separate human-owned pause after qualifying source runs; `T7` cannot start until
+the verified shards and completed calibration file are merged.
 
-**Serial order:** T1a, T1b, T1c, T2, T3, T5, T4, T6, T7.
+**Serial order:** T1a, T1b, T1c, T2, T3, T4a, T4b, T5, T6, T7.
 
 ---
 
@@ -764,14 +906,16 @@ Milestones merge in order 1 → 2 → 3 → 4, but three tasks can legitimately 
   existing decision-log entry. Run it alongside milestone 1 to de-risk milestone 3.
 - **`M1-T3a/b/c` (case authoring) is the long pole.** Start as soon as `M1-T2` lands; it does not
   block any code task and code tasks do not block it.
-- **`M2-T1` (tunable agent) only needs `M1-T2`.** It can run during milestone 1's later waves.
+- **`M2-T6` (identity, telemetry, and invariants) can start after `M1-T4`; `M2-T1` follows it.**
+  Both can run during milestone 1's later waves once their record interfaces are merged.
 
 Two files are contended across milestones and need care at merge time:
 
 | File | Touched by | Handling |
 |---|---|---|
-| `scripts/eval.py` | M1-T8, M2-T7, M3-T7, M4-T2, M4-T5 | Each adds one subcommand or option group. Merge in milestone order; within M4 take T2 before T5. |
-| `Makefile` | M1-T1, M1-T8, M2-T7, M3-T7 | Each adds one target. Append-only; conflicts are trivial. |
+| `scripts/eval.py` | M1-T8, M2-T7, M3-T7, M4-T2, M4-T5, M4-T7 | Each adds one subcommand or option group. Merge in dependency order. |
+| `Makefile` | M1-T1, M1-T8, M2-T7, M3-T7, M4-T2 | Each adds one target. Merge in dependency order. |
+| `tests/eval/test_eval_cli.py` | M1-T8, M2-T7 | M1 creates the CLI test module; M2 extends it after milestone 1 merges. |
 | `src/ticketflow/eval/report.py` | M1-T7, M4-T3, M4-T7 | The real contention. M4-T3 adds one section, M4-T7 assembles the rest. Explicit edge T3 → T7. |
 | `src/ticketflow/eval/records.py` | M1-T4, M3-T6 | M3-T6 only fills optional manifest fields left open by M1-T4. |
 
@@ -790,7 +934,10 @@ Two files are contended across milestones and need care at merge time:
 | Every inferential headline rate includes a 95% interval and names its denominator | M1-T5, M1-T6, M1-T7 |
 | Model quality, availability, and reviewer policy are reported as separate quantities | M1-T5, M2-T3, M1-T7 |
 | The threshold report presents a defensible curve or explains why it cannot | M3-T5, M4-T3 |
-| Judge-derived metrics appear only for validated dimensions | M4-T4, M4-T6, M4-T7 |
+| Judge-derived metrics appear only for validated dimensions | M4-T4a, M4-T4b, M4-T5, M4-T6, M4-T7 |
+| Stable case identity makes reviewer-policy outputs comparable | M2-T6, M2-T1, M3-T4, M3-T3 |
+| Production and CLI entrypoints cover every promised command | M3-T7, M4-T2, M4-T5, M4-T7 |
+| Verified labels and calibration ratings are human-authored | M1-T3a/b/c, M4-T1a/b/c, M4-T4b |
 
 `plan.md`'s repository-constraints table maps as follows: schedule-to-start fallback → M2-T5;
 heartbeat timeout → M3-T1; `TicketResult` omissions → M2-T4; import-time constants → M2-T2;

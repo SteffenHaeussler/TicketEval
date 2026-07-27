@@ -82,19 +82,29 @@ Its absolute score is not assumed to transfer to another fallback model.
 ```text
 evals/
   data/
-    tickets.jsonl
+    tickets/
+      easy.jsonl
+      ambiguous.jsonl
+      adversarial.jsonl
     labeling.md
+    judge_calibration_sources/
+      index.json
+      replies.jsonl
     judge_calibration.jsonl
+    judge_calibration_judgments/
+      <rubric_hash>-<judgment_id>.jsonl
   runs/<run_id>/
     manifest.json
     records.jsonl
     calls.jsonl
-    judgments/<rubric_hash>.jsonl
+    judgments/<rubric_hash>-<judgment_id>.jsonl
     report.md
   cache/
 
 src/ticketflow/
   agent/
+    factory.py
+    prompts.py
     tunable.py
     ollama.py
   eval/
@@ -105,6 +115,12 @@ src/ticketflow/
     harness.py        # milestone 2: Temporal environment and worker construction
     runner.py         # milestone 2: per-case execution
     reviewers.py      # milestone 2
+    telemetry.py      # milestone 2: identity map and call-event sink
+    invariants.py     # milestone 2
+    profiles.py       # milestone 2
+    cache.py          # milestone 3
+    preflight.py      # milestone 3
+    compare.py        # milestone 4
     scorers/
       deterministic.py  # milestone 1
       calibration.py    # milestone 4
@@ -113,14 +129,18 @@ src/ticketflow/
 scripts/eval.py
 ```
 
-Telemetry, response caching, and preflight probing live inside `agent/ollama.py`, which is the
-only module that knows about model calls; they are split out only if a second real agent appears.
-Paired comparison lives in `statistics.py` for the same reason. The directory grows per milestone
-rather than being created empty up front.
+`agent/ollama.py` owns HTTP calls and consumes narrow interfaces from `eval/cache.py`,
+`eval/preflight.py`, and `eval/telemetry.py`. Prompts and output schemas live in
+`agent/prompts.py`; production construction lives in `agent/factory.py`. This keeps each parallel
+task's file ownership disjoint without moving HTTP knowledge into eval modules. Numerical
+primitives stay in `statistics.py`; report-level paired comparison assembly lives in `compare.py`.
+The directory grows per milestone rather than being created empty up front.
 
-`records.jsonl` and `calls.jsonl` are immutable raw artifacts. Re-running the judge creates a new
-file under `judgments/`; it never rewrites raw workflow output. `evals/runs/` and `evals/cache/`
-are added to `.gitignore`; only `evals/data/` is committed.
+`records.jsonl` and `calls.jsonl` are immutable raw artifacts. Re-running the judge creates
+`judgments/<rubric_hash>-<judgment_id>.jsonl`, where `judgment_id` is a UTC timestamp plus a random
+suffix; it never rewrites raw workflow output. `evals/runs/` and `evals/cache/` are added to
+`.gitignore`; `evals/data/` contains the committed datasets and the minimal, hash-verified
+calibration bundle needed to hand real replies between workspace branches.
 
 ---
 
@@ -131,6 +151,7 @@ are added to `.gitignore`; only `evals/data/` is committed.
 ```python
 class ExpectedOutcome(BaseModel):
     acceptable_categories: set[TicketCategory]
+    reference_category: TicketCategory
     acceptable_actions: set[ActionType]
     expected_refund_amount: float | None = None
     refund_tolerance: float = 0.01
@@ -144,34 +165,59 @@ class EvalCase(BaseModel):
     expected: ExpectedOutcome
     difficulty: Literal["easy", "ambiguous", "adversarial"]
     source: Literal["handwritten", "generated"]
+    authored_by: str
     generated_by: str | None = None
     label_verified: bool
+    verified_by: str | None = None
+    verified_at: datetime | None = None
     notes: str | None = None
 ```
 
 ### Labelling rules
 
 - Every case has at least one acceptable category and action.
+- `reference_category` is required, belongs to `acceptable_categories`, and is used only for
+  category-distribution validation, precision, recall, F1, and confusion-matrix cells. Binary
+  category correctness still accepts any member of `acceptable_categories`.
 - Ambiguous cases may have multiple acceptable outcomes.
 - A refund is expected only when the ticket explicitly requests one for a duplicate or incorrect
   charge and states the amount.
 - The expected refund amount must appear in the ticket text and match within
   `refund_tolerance`.
 - Committed cases have `label_verified=true`.
+- `source="handwritten"` means a named human wrote the ticket text and labels; an agent-authored or
+  LLM-authored case is `source="generated"` and records `generated_by`.
 - Generated cases record `generated_by`, remain separately sliced in reports, and require human
   verification.
+- A verified case records non-empty `verified_by` and `verified_at`; an unverified case records
+  neither.
 - `evals/data/labeling.md` documents the policy and includes positive, negative, ambiguous, and
   adversarial examples.
 
-The loader rejects:
+`label_verified=true` is a human-owned assertion. Agents may draft generated cases with
+`label_verified=false`, but a named human reviewer must approve the labels before changing it to
+`true` and before the shard can pass the release-level dataset check. The same `authored_by`
+identity may not act as `verified_by`.
 
-- Duplicate IDs.
-- Empty acceptable category or action sets.
-- Unverified labels.
-- Refund labels without an amount.
-- Refund amounts that do not appear in the ticket.
-- Generated cases without generator provenance.
-- Dataset tier or category balance outside configured tolerance.
+Validation has two explicit levels:
+
+1. `load_cases(path, require_verified=True)` performs structural validation for a file or
+   directory. It rejects duplicate IDs across the loaded union, empty acceptable category or action
+   sets, a `reference_category` outside `acceptable_categories`, refund labels without an amount,
+   refund amounts absent from the ticket, and generated cases without generator provenance,
+   missing `authored_by`, or a handwritten case with
+   `generated_by`. With the default `require_verified=True`, it also rejects unverified,
+   anonymously verified, or self-verified labels. Authoring checks use `require_verified=False`;
+   this mode is valid for one shard and never applies distribution rules.
+2. `validate_dataset(cases)` applies release-level distribution rules to the complete union. Easy
+   and ambiguous cases must each comprise 30–50% of the dataset, adversarial cases 15–35%, and
+   every `reference_category` 15–35%. These numeric ranges are the defaults and may be overridden
+   only by an explicit `DatasetValidationPolicy` recorded in the manifest.
+
+A refund amount appears in the ticket when a standalone decimal token in `subject` or `body`,
+optionally prefixed by `$`, `€`, or `£` or followed by `USD`, `EUR`, or `GBP`, parses to the expected
+amount within `refund_tolerance`. Both `.` and `,` are accepted as the decimal separator; thousands
+separators are not accepted. Every rejection names the offending case ID and source shard.
 
 ### Initial dataset
 
@@ -190,10 +236,26 @@ Milestone 4 grows the dataset toward approximately 200 verified cases:
 Repeats do not increase the effective number of labelled cases. `--repeats` defaults to 1.
 Repeated runs measure self-consistency and are clustered by case in all uncertainty calculations.
 
-`--repeats > 1` implies `--no-cache` and a varied or absent seed, and the CLI enforces this. With
-the cache on, every repeat after the first is a cache hit by construction; at `temperature=0` with
-a fixed seed, repeats measure the decoder's determinism rather than the model's self-consistency.
-Either way the measurement would be vacuous.
+`--seed` is the reproducible run seed and defaults to `0`. For each case and repeat, the
+model-generation seed is
+derived from `SHA-256(run_seed, case_key, repeat_index)`; it is therefore identical across reviewer
+policies for the same case and repeat, but different across repeats. `--bootstrap-seed` controls
+statistical resampling separately and defaults to `0`.
+
+`--repeats > 1` implies `--no-cache`, and the CLI enforces this. With the cache on, every repeat
+after the first would be a cache hit by construction. The harness always sends the derived
+generation seed to Ollama and includes it in the cache key.
+
+### Stable case identity
+
+`EvalCase.id` is the immutable `case_key` used for expected-label lookup, tunable-agent hashing,
+pairing, and cache identity. Workflow and ticket IDs remain unique per run, policy, case, and repeat,
+but are execution identifiers only; they never influence a model request or model randomness.
+
+The runner gives every constructed agent a read-only mapping from runtime ticket ID to `case_key`.
+Cache requests contain the `case_key`, customer email, subject, and body, but explicitly exclude the
+runtime ticket ID. This guarantees byte-identical agent outputs for oracle and rubber-stamp policy
+runs while preserving distinct workflow and read-model identities.
 
 ---
 
@@ -201,9 +263,12 @@ Either way the measurement would be vacuous.
 
 ### Scored population
 
-A case is **scored** only if it produced a draft. Cases that escalated because the agent failed,
-exhausted retries, or never returned a valid structured output have no prediction and are not
-scorable.
+A case is **scored** exactly when it produced a draft. `prediction_available` is derived from
+`draft is not None`; it is never inferred from the workflow's terminal outcome. A rejected update
+or runner deadline may happen after a draft exists, so those cases remain structurally scorable
+even though their execution did not complete normally. Cases that escalated before a draft because
+the agent failed, exhausted retries, or never returned a valid structured output have no prediction
+and are not scorable.
 
 This matters because escalation is not silent: the workflow still sends `ESCALATION_REPLY` and
 never gates it. Folding escalations into a structured-quality headline would count an availability
@@ -215,6 +280,12 @@ failure as a classification error. Therefore:
   folded in.
 - A single combined `unhelpful_outcome_rate` over all cases may be reported as a customer-facing
   summary, clearly labelled as combining quality and availability.
+
+`invalid_output_rate` is the proportion of all cases with at least one `CallEvent` whose outcome is
+`invalid_output`, whether or not repair later succeeds. A repaired case that ultimately produces a
+draft remains in every applicable structured-quality denominator. An exhausted repair that produces
+no draft is excluded because `prediction_available=false`, not merely because an earlier attempt
+was invalid.
 
 Each scored case record derives:
 
@@ -319,14 +390,30 @@ agent outputs. Cache-hit policy runs are excluded from model-latency and reliabi
 
 For each case and repeat:
 
-1. Assign a unique workflow and ticket ID containing the run, policy, case, and repeat.
+1. Assign a unique workflow and ticket ID containing the run, policy, case, and repeat, and register
+   its mapping to the stable dataset `case_key`.
 2. Start `TicketWorkflow` on a run-specific task queue, under a per-case wall-clock deadline.
 3. Poll until the workflow either reaches `AWAITING_APPROVAL` or terminates.
 4. If approval is required, calculate the reviewer decision and submit it with `execute_update`.
 5. Await the terminal `TicketResult`.
 6. Query `TicketWorkflow.status` after completion to capture classification, draft, and decision.
-7. Query refund and refund-attempt rows for the ticket.
+7. Query refund and refund-attempt counts through public read-model helpers.
 8. Emit one `CaseRecord` plus its `CallEvent` entries.
+
+The read model exposes one observation boundary for the runner:
+
+```python
+class RefundObservation(BaseModel):
+    executed_count: int
+    attempt_count: int
+
+
+def get_refund_observation(
+    ticket_id: str, db_path: str | None = None
+) -> RefundObservation: ...
+```
+
+The runner never queries SQLite directly.
 
 ### Submitting approval
 
@@ -345,9 +432,12 @@ runner:
 
 The fallback activity is dispatched without a schedule-to-start timeout and the workflow has no
 run timeout, so a misconfigured or missing fallback worker parks the activity task indefinitely
-rather than failing. The runner therefore imposes its own wall-clock deadline per case and records
-a `timeout` terminal outcome, so a harness misconfiguration surfaces as a recorded result instead
-of a hung run.
+rather than failing. The runner therefore imposes its own wall-clock deadline per case. At the
+deadline it captures a best-effort status query, requests workflow cancellation, and waits up to
+five seconds for cancellation to be confirmed. If cancellation is not confirmed, it terminates the
+workflow with reason `eval runner deadline exceeded`. The record keeps
+`terminal_outcome="runner_deadline_exceeded"` and `cleanup_action="cancelled"|"terminated"`;
+cleanup never changes whether a captured draft is scorable.
 
 ### Environment construction
 
@@ -365,6 +455,22 @@ never to a single case.
 The harness moves reusable worker construction out of `tests/helpers.py` into production eval code.
 `tests/helpers.py` re-exports the helper so existing workflow tests remain unchanged.
 
+The harness accepts and snapshots this configuration before workers start:
+
+```python
+class WorkflowEvalConfig(BaseModel):
+    confidence_threshold: float
+    agent_task_queue: str
+    fallback_task_queue: str
+    agent_schedule_to_start_s: float
+    agent_activity_timeout_s: float
+    agent_heartbeat_timeout_s: float
+```
+
+It patches all six corresponding workflow module constants under
+`UnsandboxedWorkflowRunner`. Preflight returns an updated `WorkflowEvalConfig`; it does not mutate
+workflow globals itself.
+
 The harness supports:
 
 - Separate primary and fallback agents.
@@ -380,8 +486,18 @@ The harness supports:
 
 ### Production seam
 
-Production configuration supports `mock` and `ollama`. The LLM worker uses a small factory for
-primary and fallback roles.
+Production configuration supports `TICKETFLOW_AGENT_BACKEND=mock|ollama`, defaulting to `mock`.
+The LLM worker uses `build_agent(role, settings, cache=None, event_sink=None)` for both roles.
+Production calls deliberately pass no response cache; the eval harness injects its file cache and
+telemetry sink explicitly. Ollama settings include endpoint, primary model, fallback model, request
+timeout, and seed; the defaults come from the verified model-role section above. Invalid backends
+fail during worker startup with an actionable configuration error.
+
+The environment keys are `TICKETFLOW_OLLAMA_ENDPOINT` (default `http://localhost:11434`),
+`TICKETFLOW_PRIMARY_MODEL` (default `qwen3.6:35b`), `TICKETFLOW_FALLBACK_MODEL` (default
+`qwen2.5-coder:1.5b`), `TICKETFLOW_OLLAMA_TIMEOUT_S` (default `90`),
+and `TICKETFLOW_OLLAMA_SEED` (optional). The eval-only cache directory defaults to `evals/cache`
+and is controlled by the eval CLI, not the production worker.
 
 The general workflow worker continues to avoid constructing an Ollama client because its
 registered side-effect activities never call the agent.
@@ -391,10 +507,11 @@ run configuration. The production factory is not responsible for label-aware tun
 
 ### Tunable mock
 
-`TunableMockAgent` derives each decision from a stable hash of:
+`TunableMockAgent` resolves the runtime ticket ID through the runner-provided identity mapping and
+derives each decision from a stable hash of:
 
 ```text
-(seed, ticket.id, operation)
+(generation_seed, case_key, operation)
 ```
 
 Its profile controls:
@@ -464,8 +581,10 @@ Each classification or drafting attempt emits:
 ```python
 class CallEvent(BaseModel):
     run_id: str
-    case_id: str
+    case_key: str
+    ticket_id: str
     policy: str
+    repeat_index: int
     operation: Literal["classify", "draft"]
     role: Literal["primary", "fallback"]
     attempt: int
@@ -491,16 +610,35 @@ Reports distinguish:
 
 `model_path` alone is not used as a retry counter.
 
+`(run_id, policy, case_key, repeat_index, ticket_id)` is the event-to-record join key. `case_key`
+never carries a runtime ticket ID, and `ticket_id` is never overloaded as the dataset identity.
+
 ---
 
 ## Response cache
 
-Only successful agent responses are cached. The cache key hashes the complete normalized request:
+Only successful agent responses are cached. Cache integration uses this exact boundary:
+
+```python
+class ResponseCache(Protocol):
+    def get(self, request: CacheRequest) -> CachedAgentResponse | None: ...
+    def put_success(
+        self, request: CacheRequest, response: CachedAgentResponse
+    ) -> None: ...
+```
+
+`CacheRequest` is the normalized, serializable request described below.
+`CachedAgentResponse` contains the validated output payload and response timing metadata. The Ollama
+agent is the sole consumer: it checks `get` before HTTP, calls `put_success` only after validation,
+and emits a cache-hit `CallEvent` when a value is returned. Error and invalid-output paths never
+call `put_success`.
+
+The cache key hashes the complete normalized request:
 
 - Operation (`classify` or `draft`).
 - Model name and digest.
 - Role.
-- Ticket content.
+- Stable `case_key`, customer email, subject, and body; never the runtime ticket ID.
 - Classification input for drafting.
 - Messages and prompt version.
 - JSON schema.
@@ -525,8 +663,10 @@ operation, input, model, prompt, schema, or generation configuration invalidates
 - Reply text and role-based model path.
 - Terminal status, gating, and approval decision.
 - Refund and refund-attempt counts.
-- Whether the case was scorable, and if not, why: escalated, invalid output, update rejected, or
-  runner deadline exceeded.
+- `prediction_available`, derived solely from whether a draft was captured, plus an optional
+  prediction-unavailable detail for diagnostics.
+- A separate `terminal_outcome`: `resolved`, `rejected`, `escalated`, `update_rejected`, or
+  `runner_deadline_exceeded`, plus the deadline cleanup action when applicable.
 - End-to-end latency and terminal error.
 
 Classification, draft, and decision come from the post-completion `status` query. Its `result`
@@ -540,7 +680,7 @@ from awaiting the workflow handle.
 - Agent implementation and run profile.
 - Real model names and digests.
 - Ollama, Python, and relevant dependency versions.
-- Prompt, schema, and rubric hashes.
+- Prompt and schema hashes.
 - Generation options.
 - Reviewer policies and order.
 - Cache setting.
@@ -550,6 +690,10 @@ from awaiting the workflow handle.
 
 Raw artifacts are immutable. Reports and judgments always point back to their source record and
 manifest hashes.
+
+Rubric and judge identity do not belong in the immutable run manifest because one run may be judged
+multiple times. Every judgment artifact records its own rubric hash, judge model name and digest,
+generation options, source `records.jsonl` hash, source manifest hash, and `judgment_id`.
 
 ---
 
@@ -562,9 +706,10 @@ Before a real-model run:
 3. Run one unmeasured warm-up.
 4. Measure at least three representative classifications and three drafts.
 5. Separate model-load time from generation time.
-6. Set the effective activity timeout to the larger of the configured value or three times the
-   slowest observed stage.
-7. Set the HTTP timeout below the activity timeout with a safety margin.
+6. Set the effective activity timeout to
+   `max(10.0, configured_activity_timeout_s, 3 * slowest_observed_stage_s)`.
+7. Set the safety margin to `max(5.0, 0.10 * effective_activity_timeout_s)` and the HTTP timeout to
+   `effective_activity_timeout_s - safety_margin`.
 8. Record measurements and every timeout adjustment in the manifest.
 9. Probe approximately ten cases for confidence variance.
 
@@ -596,7 +741,7 @@ caught by tests.
 
 - Use case-clustered percentile bootstrap intervals.
 - Resample cases while retaining all repeats for each selected case.
-- Use 5,000 samples, a fixed manifest seed, and 95% intervals.
+- Use 5,000 samples, `bootstrap_seed` from the manifest, and 95% intervals.
 - Attach intervals to rates and derived scores.
 - Raw counts, configuration values, and confusion-matrix cells do not require intervals.
 - Report self-consistency separately from accuracy.
@@ -643,7 +788,7 @@ Each report includes:
 
 - Dataset size, source, difficulty, and category composition.
 - Scored population size beside total cases, with the reason for every exclusion.
-- Directional-only labelling for approximately 50-case runs.
+- Directional-only labelling whenever the scored population is less than 100.
 - Structured quality metrics and confidence intervals.
 - Escalation and invalid-output rates, kept visibly separate from quality metrics.
 - Primary-versus-fallback paired comparisons.
@@ -673,15 +818,36 @@ The judge scores stored reply text on:
 2. Appropriate support tone, 1–5.
 3. Hallucinated commitments, boolean.
 
-Judge calibration uses at least 30 replies spanning good, weak, irrelevant, and hallucinated
-outputs. Two humans score them independently and adjudicate disagreements.
+Before human calibration begins, qualifying source runs execute at least 30 real cases under each
+of the primary-quality and fallback-quality profiles, yielding at least 60 immutable stored reply
+records. A minimal committed bundle under `evals/data/judge_calibration_sources/` copies the ticket
+context and reply needed for judging. Its index records source run IDs, manifest and records hashes,
+and a content hash for every copied record, so another workspace can verify the handoff without
+access to gitignored `evals/runs/` artifacts.
+
+Agents may stratify candidates only with non-authoritative proxies such as structured correctness,
+confidence, profile, and difficulty. A named human screens the pool for good, weak, irrelevant, and
+hallucinated coverage without exposing those screening labels to the two independent raters. If the
+pool cannot supply at least 30 replies spanning all four classes, additional source runs and a new
+verified bundle revision are required.
+
+Two named humans then score the sampled replies independently without seeing each other's ratings
+or the screening labels, and a named human adjudicator records the final label. Agents may prepare
+the sampling file and compute agreement, but may not author the screening class, either human
+rating, or the adjudication. Gemma scores the completed calibration set before any production run is
+judged.
 
 Validation gates:
 
-- Weighted Cohen's κ of at least 0.60 for relevance.
-- Weighted Cohen's κ of at least 0.60 for tone.
-- Cohen's κ of at least 0.60 and F1 of at least 0.80 for hallucination.
-- Agreement intervals and calibration sample size appear in the report.
+- Gemma versus adjudicated humans: linearly weighted Cohen's κ of at least 0.60 for relevance.
+- Gemma versus adjudicated humans: linearly weighted Cohen's κ of at least 0.60 for tone.
+- Gemma versus adjudicated humans: Cohen's κ of at least 0.60 and F1 of at least 0.80 for
+  hallucination.
+- Hallucination is the positive class for F1.
+- Agreement intervals use a 5,000-sample percentile bootstrap over calibration replies with
+  `bootstrap_seed`; intervals and calibration sample size appear in the report.
+- The same human-human agreement statistics are reported as rubric-quality evidence, but do not
+  substitute for Gemma-versus-adjudicated validation.
 - A failing dimension is suppressed without suppressing dimensions that passed.
 
 Judge-derived response-issue rates remain secondary to deterministic structured metrics. Using a
@@ -704,12 +870,15 @@ compare --baseline <id> --candidate <id>
 
 Important options:
 
+- `dataset-check --shard PATH [--allow-unverified]` for structural authoring checks; the default
+  `dataset-check` performs verified structural and whole-dataset validation.
 - `--agent tunable|mock|ollama`
 - `--reviewer oracle|rubber_stamp|both`
 - `--limit N`
 - `--repeats N`
 - `--concurrency N`
-- `--seed N`
+- `--seed N` (default `0`)
+- `--bootstrap-seed N`
 - `--no-cache`
 - Model and Ollama endpoint overrides
 
@@ -773,6 +942,7 @@ Acceptance:
 Deliver:
 
 - Lifecycle-managed Ollama agent.
+- Production mock/Ollama agent factory and worker configuration.
 - Operation-specific prompts and schemas.
 - Periodic activity heartbeats.
 - Complete cache keys and atomic entries.
@@ -785,9 +955,11 @@ Acceptance:
 - Primary and fallback quality profiles run over the same limited case set.
 - Policy runs receive byte-identical cached outputs.
 - HTTP, validation, and timeout failures map to the expected agent error classes.
-- A degraded fallback model reports a measurable `invalid_output_rate` rather than escalating
-  every malformed refund.
-- Qwen and Gemma are not resident simultaneously.
+- Stubbed malformed-output runs prove `invalid_output_rate` is recorded separately from escalation;
+  the limited real fallback run reports any observed invalid-output rate as diagnostic rather than
+  requiring a non-zero value.
+- The primary model is unloaded before the fallback smoke phase; the judge is not loaded in this
+  milestone.
 
 ### Milestone 4 — Decision-grade evaluation
 
@@ -796,6 +968,7 @@ Deliver:
 - Dataset growth toward 200 verified cases.
 - Paired comparison reports.
 - Threshold sweep and confidence diagnostics.
+- Qualifying real-model source runs for judge calibration.
 - Judge calibration and versioned judgment artifacts.
 - Final source/difficulty slices.
 
@@ -804,6 +977,7 @@ Acceptance:
 - The report can support or reject the current 0.75 threshold while displaying uncertainty.
 - The primary-versus-fallback comparison reports a paired degradation estimate.
 - No judge dimension appears unless its validation gate passes.
+- Agent models are unloaded and residency is verified before Gemma is loaded.
 
 ---
 
@@ -812,9 +986,9 @@ Acceptance:
 - Dataset validation rejects duplicate IDs, empty labels, unverified labels, inconsistent refunds,
   and missing generated provenance.
 - Structured scorer tests use synthetic records with exact expected rates.
-- Scoring tests prove escalated and invalid-output cases are excluded from quality denominators
-  and counted in their own rates, and that `gate_recall` and `gate_precision` are identical under
-  both reviewer policies.
+- Scoring tests prove cases without drafts are excluded from quality denominators, repaired drafts
+  remain scored, any case with an invalid-output event contributes to `invalid_output_rate`, and
+  `gate_recall` and `gate_precision` are identical under both reviewer policies.
 - Bootstrap tests prove repeats remain clustered by case.
 - Comparison tests cover unchanged runs, meaningful regressions, and underpowered changes that must
   not be flagged.
@@ -829,8 +1003,11 @@ Acceptance:
   raises `AgentPermanentError`, and that a refund missing its amount does not escalate on the
   first attempt.
 - Runner tests prove a rejected approval update and an exceeded per-case deadline are recorded as
-  case outcomes rather than aborting the run.
-- Heartbeat tests prove long agent calls cannot hit the 30-second heartbeat timeout.
+  case outcomes rather than aborting the run, and prove deadline cleanup cancels or terminates the
+  underlying workflow.
+- Heartbeat unit tests inject a 10-millisecond interval into the heartbeat-loop helper and prove
+  repeated heartbeats and cancellation on success and error without a 30-second sleep. The local
+  Ollama smoke run provides the real-time integration check.
 - Judge tests cover per-dimension calibration gates and versioned output.
 - A complete `make check` remains the final repository regression gate.
 
@@ -849,7 +1026,8 @@ Acceptance:
    ticket without retry or fallback. Give validation failures a repair budget, report
    `invalid_output_rate` and `escalation_rate` separately, and score quality only over cases that
    produced a draft.
-6. **Small samples are over-interpreted.** Always report intervals and mark N≈50 runs directional.
+6. **Small samples are over-interpreted.** Always report intervals and mark runs with fewer than
+   100 scored cases directional.
 7. **Confidence is constant or meaningless.** Diagnose variance and distinctness, and suppress
    unsupported sweeps.
 8. **Generated data is easier than real traffic.** Require human verification and report by source.
@@ -873,3 +1051,5 @@ The harness is complete when:
 - The threshold report either presents a defensible tradeoff curve or explicitly explains why the
   model's confidence cannot support threshold tuning.
 - Judge-derived metrics appear only for validated dimensions.
+- Every committed `label_verified=true` case has a named human verifier, and judge calibration
+  contains two independent named human ratings plus a named adjudicator.
