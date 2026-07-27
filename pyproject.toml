@@ -24,6 +24,10 @@ dev = [
     "pre-commit>=4.6.0",
     "pyright>=1.1.410",
 ]
+eval = [
+    "numpy>=2.0",
+    "scipy>=1.14",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -36,9 +40,10 @@ packages = ["src/ticketflow"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
-addopts = "-m 'not smoke'"
+addopts = "-m 'not smoke and not ollama'"
 markers = [
     "smoke: end-to-end tests against a running docker stack (make up)",
+    "ollama: tests that call a real running Ollama server",
 ]
 
 [tool.ruff]
