@@ -6,7 +6,7 @@ JAEGER_URL ?= http://localhost:16686
 TEMPORAL_NAMESPACE ?= default
 
 install:
-	uv sync
+	uv sync --all-groups
 	uv run pre-commit install --hook-type pre-push
 
 install-hooks:
