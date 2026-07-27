@@ -1,6 +1,7 @@
 """Deterministic correctness predicates and metrics, per plan.md's correctness rules."""
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -45,6 +46,15 @@ class Rate(BaseModel):
         return self.numerator / self.denominator if self.denominator else None
 
 
+class RateSeries(BaseModel):
+    """A denominator-bearing rate and its case-clustered binary observations."""
+
+    model_config = ConfigDict(frozen=True)
+
+    rate: Rate
+    clustered_values: tuple[tuple[str, float], ...]
+
+
 class ConfusionMatrix(BaseModel):
     """Reference-category-by-predicted-category counts over one population."""
 
@@ -63,7 +73,7 @@ class CategoryClassMetrics(BaseModel):
     category: TicketCategory
     precision: Rate
     recall: Rate
-    f1: float | None
+    f1: Rate
 
 
 class RefundAmountError(BaseModel):
@@ -173,107 +183,230 @@ def _case_identity(obj: CaseRecord | CallEvent) -> tuple[str, str, str, int, str
     return (obj.run_id, obj.policy, obj.case_key, obj.repeat_index, obj.ticket_id)
 
 
+def _rate_series(
+    pairs: Sequence[tuple[str, float]], denominator_label: str
+) -> RateSeries:
+    """Build a rate and preserve the exact observations behind its denominator."""
+    clustered_values = tuple(pairs)
+    rate = Rate(
+        numerator=sum(int(value) for _, value in clustered_values),
+        denominator=len(clustered_values),
+        denominator_label=denominator_label,
+    )
+    return RateSeries(rate=rate, clustered_values=clustered_values)
+
+
+def _scored_pairs(
+    records: Sequence[CaseRecord], predicate: Callable[[CaseRecord], bool]
+) -> list[tuple[str, float]]:
+    """Return binary observations over the scored population."""
+    return [
+        (record.case_key, float(predicate(record)))
+        for record in records
+        if record.prediction_available
+    ]
+
+
+def _incorrect_scored_pairs(
+    records: Sequence[CaseRecord], predicate: Callable[[CaseRecord], bool]
+) -> list[tuple[str, float]]:
+    """Return observations over scored records with an incorrect outcome."""
+    return [
+        (record.case_key, float(predicate(record)))
+        for record in records
+        if record.prediction_available and not structured_correct(record)
+    ]
+
+
+def _gated_scored_pairs(
+    records: Sequence[CaseRecord], predicate: Callable[[CaseRecord], bool]
+) -> list[tuple[str, float]]:
+    """Return observations over gated records in the scored population."""
+    return [
+        (record.case_key, float(predicate(record)))
+        for record in records
+        if record.prediction_available and record.was_gated
+    ]
+
+
+def _event_flag_pairs(
+    records: Sequence[CaseRecord],
+    events: Sequence[CallEvent],
+    predicate: Callable[[CallEvent], bool],
+) -> list[tuple[str, float]]:
+    """Flag every record whose joined call events satisfy predicate."""
+    flagged = {_case_identity(event) for event in events if predicate(event)}
+    return [
+        (record.case_key, float(_case_identity(record) in flagged))
+        for record in records
+    ]
+
+
+RateValuesBuilder = Callable[
+    [Sequence[CaseRecord], Sequence[CallEvent]], list[tuple[str, float]]
+]
+
+
+@dataclass(frozen=True)
+class _RateSpec:
+    """One headline rate's denominator and observation builder."""
+
+    denominator_label: str
+    build_values: RateValuesBuilder
+
+
+_RATE_SPECS = {
+    "unreviewed_structured_error_rate": _RateSpec(
+        "scored_population",
+        lambda records, _: _scored_pairs(
+            records,
+            lambda record: not record.was_gated and not structured_correct(record),
+        ),
+    ),
+    "unreviewed_category_error_rate": _RateSpec(
+        "scored_population",
+        lambda records, _: _scored_pairs(
+            records,
+            lambda record: not record.was_gated and not category_correct(record),
+        ),
+    ),
+    "unreviewed_action_error_rate": _RateSpec(
+        "scored_population",
+        lambda records, _: _scored_pairs(
+            records,
+            lambda record: not record.was_gated and not action_correct(record),
+        ),
+    ),
+    "review_load": _RateSpec(
+        "scored_population",
+        lambda records, _: _scored_pairs(records, lambda record: record.was_gated),
+    ),
+    "gate_recall": _RateSpec(
+        "incorrect_scored_cases",
+        lambda records, _: _incorrect_scored_pairs(
+            records, lambda record: record.was_gated
+        ),
+    ),
+    "gate_precision": _RateSpec(
+        "gated_scored_cases",
+        lambda records, _: _gated_scored_pairs(
+            records, lambda record: not structured_correct(record)
+        ),
+    ),
+    "action_accuracy": _RateSpec(
+        "scored_population",
+        lambda records, _: _scored_pairs(records, action_correct),
+    ),
+    "escalation_rate": _RateSpec(
+        "all_cases",
+        lambda records, _: [
+            (record.case_key, float(record.terminal_outcome == "escalated"))
+            for record in records
+        ],
+    ),
+    "invalid_output_rate": _RateSpec(
+        "all_cases",
+        lambda records, events: _event_flag_pairs(
+            records, events, lambda event: event.outcome == "invalid_output"
+        ),
+    ),
+    "fallback_usage_rate": _RateSpec(
+        "all_cases",
+        lambda records, events: _event_flag_pairs(
+            records, events, lambda event: event.role == "fallback"
+        ),
+    ),
+    "unhelpful_outcome_rate": _RateSpec(
+        "all_cases_combining_quality_and_availability",
+        lambda records, _: [
+            (
+                record.case_key,
+                float(
+                    not record.prediction_available or not structured_correct(record)
+                ),
+            )
+            for record in records
+        ],
+    ),
+}
+
+
+def _build_named_rate_series(
+    name: str,
+    records: Sequence[CaseRecord],
+    events: Sequence[CallEvent] = (),
+) -> RateSeries:
+    """Build one named rate from the central rate specification."""
+    spec = _RATE_SPECS[name]
+    return _rate_series(spec.build_values(records, events), spec.denominator_label)
+
+
 def unreviewed_structured_error_rate(records: Sequence[CaseRecord]) -> Rate:
     """Return the share of scored, ungated cases with an incorrect outcome."""
-    scored = _scored_population(records)
-    n = sum(1 for r in scored if not r.was_gated and not structured_correct(r))
-    return Rate(
-        numerator=n, denominator=len(scored), denominator_label="scored_population"
-    )
+    return _build_named_rate_series("unreviewed_structured_error_rate", records).rate
 
 
 def unreviewed_category_error_rate(records: Sequence[CaseRecord]) -> Rate:
     """Return the share of scored, ungated cases with an incorrect category."""
-    scored = _scored_population(records)
-    n = sum(1 for r in scored if not r.was_gated and not category_correct(r))
-    return Rate(
-        numerator=n, denominator=len(scored), denominator_label="scored_population"
-    )
+    return _build_named_rate_series("unreviewed_category_error_rate", records).rate
 
 
 def unreviewed_action_error_rate(records: Sequence[CaseRecord]) -> Rate:
     """Return the share of scored, ungated cases with an incorrect action."""
-    scored = _scored_population(records)
-    n = sum(1 for r in scored if not r.was_gated and not action_correct(r))
-    return Rate(
-        numerator=n, denominator=len(scored), denominator_label="scored_population"
-    )
+    return _build_named_rate_series("unreviewed_action_error_rate", records).rate
 
 
 def review_load(records: Sequence[CaseRecord]) -> Rate:
     """Return the share of scored cases gated for approval."""
-    scored = _scored_population(records)
-    n = sum(1 for r in scored if r.was_gated)
-    return Rate(
-        numerator=n, denominator=len(scored), denominator_label="scored_population"
-    )
+    return _build_named_rate_series("review_load", records).rate
 
 
 def gate_recall(records: Sequence[CaseRecord]) -> Rate:
     """Return P(gated | not structured_correct) over the scored population."""
-    scored = _scored_population(records)
-    incorrect = [r for r in scored if not structured_correct(r)]
-    n = sum(1 for r in incorrect if r.was_gated)
-    return Rate(
-        numerator=n,
-        denominator=len(incorrect),
-        denominator_label="incorrect_scored_cases",
-    )
+    return _build_named_rate_series("gate_recall", records).rate
 
 
 def gate_precision(records: Sequence[CaseRecord]) -> Rate:
     """Return P(not structured_correct | gated) over the scored population."""
-    scored = _scored_population(records)
-    gated = [r for r in scored if r.was_gated]
-    n = sum(1 for r in gated if not structured_correct(r))
-    return Rate(
-        numerator=n, denominator=len(gated), denominator_label="gated_scored_cases"
-    )
+    return _build_named_rate_series("gate_precision", records).rate
 
 
 def action_accuracy(records: Sequence[CaseRecord]) -> Rate:
     """Return the share of scored cases with a correct action, regardless of gating."""
-    scored = _scored_population(records)
-    n = sum(1 for r in scored if action_correct(r))
-    return Rate(
-        numerator=n, denominator=len(scored), denominator_label="scored_population"
-    )
+    return _build_named_rate_series("action_accuracy", records).rate
 
 
 def escalation_rate(records: Sequence[CaseRecord]) -> Rate:
     """Return the share of all cases that escalated."""
-    n = sum(1 for r in records if r.terminal_outcome == "escalated")
-    return Rate(numerator=n, denominator=len(records), denominator_label="all_cases")
+    return _build_named_rate_series("escalation_rate", records).rate
 
 
 def invalid_output_rate(
     records: Sequence[CaseRecord], events: Sequence[CallEvent]
 ) -> Rate:
     """Return the share of all cases with at least one invalid-output call event."""
-    flagged = {_case_identity(e) for e in events if e.outcome == "invalid_output"}
-    n = sum(1 for r in records if _case_identity(r) in flagged)
-    return Rate(numerator=n, denominator=len(records), denominator_label="all_cases")
+    return _build_named_rate_series("invalid_output_rate", records, events).rate
 
 
 def fallback_usage_rate(
     records: Sequence[CaseRecord], events: Sequence[CallEvent]
 ) -> Rate:
     """Return the share of all cases with at least one fallback-role call event."""
-    flagged = {_case_identity(e) for e in events if e.role == "fallback"}
-    n = sum(1 for r in records if _case_identity(r) in flagged)
-    return Rate(numerator=n, denominator=len(records), denominator_label="all_cases")
+    return _build_named_rate_series("fallback_usage_rate", records, events).rate
 
 
 def unhelpful_outcome_rate(records: Sequence[CaseRecord]) -> Rate:
     """Return the combined quality-and-availability failure rate over all cases."""
-    n = sum(
-        1 for r in records if not r.prediction_available or not structured_correct(r)
-    )
-    return Rate(
-        numerator=n,
-        denominator=len(records),
-        denominator_label="all_cases_combining_quality_and_availability",
-    )
+    return _build_named_rate_series("unhelpful_outcome_rate", records).rate
+
+
+def build_rate_series(
+    records: Sequence[CaseRecord], events: Sequence[CallEvent]
+) -> dict[str, RateSeries]:
+    """Build every headline rate and the exact observations behind each rate."""
+    return {
+        name: _build_named_rate_series(name, records, events) for name in _RATE_SPECS
+    }
 
 
 def category_confusion_matrix(records: Sequence[CaseRecord]) -> ConfusionMatrix:
@@ -309,17 +442,57 @@ def category_class_metrics(
             denominator=tp + fn,
             denominator_label=f"reference_{cat.value}",
         )
-        p, r = precision.value, recall.value
-        if p is None or r is None:
-            f1 = None
-        elif p == 0.0 and r == 0.0:
-            f1 = 0.0
-        else:
-            f1 = 2 * p * r / (p + r)
+        f1 = Rate(
+            numerator=2 * tp,
+            denominator=2 * tp + fp + fn,
+            denominator_label=f"f1_2tp_plus_fp_plus_fn_{cat.value}",
+        )
         result[cat] = CategoryClassMetrics(
             category=cat, precision=precision, recall=recall, f1=f1
         )
     return result
+
+
+def category_f1_clustered_values(
+    records: Sequence[CaseRecord], category: TicketCategory
+) -> list[tuple[str, tuple[bool, bool]]]:
+    """Return case-clustered (is_reference, is_predicted) values for class F1."""
+    values = []
+    for record in records:
+        if not record.prediction_available:
+            continue
+        predicted = _predicted_category_or_raise(record)
+        is_reference = record.expected.reference_category == category
+        is_predicted = predicted == category
+        if is_reference or is_predicted:
+            values.append((record.case_key, (is_reference, is_predicted)))
+    return values
+
+
+def category_precision_clustered_values(
+    records: Sequence[CaseRecord], category: TicketCategory
+) -> list[tuple[str, float]]:
+    """Return correctness values over records predicted as category."""
+    return [
+        (
+            record.case_key,
+            float(record.expected.reference_category == category),
+        )
+        for record in records
+        if record.prediction_available and record.predicted_category == category
+    ]
+
+
+def category_recall_clustered_values(
+    records: Sequence[CaseRecord], category: TicketCategory
+) -> list[tuple[str, float]]:
+    """Return correctness values over records whose reference is category."""
+    return [
+        (record.case_key, float(record.predicted_category == category))
+        for record in records
+        if record.prediction_available
+        and record.expected.reference_category == category
+    ]
 
 
 def refund_amount_error(records: Sequence[CaseRecord]) -> RefundAmountError:
@@ -345,23 +518,26 @@ def score_run(
     """Compute every M1-T5 deterministic metric for one run's records and events."""
     scored = _scored_population(records)
     matrix = category_confusion_matrix(records)
+    series = build_rate_series(records, events)
     return DeterministicMetrics(
         scored_population_size=len(scored),
         total_population_size=len(records),
-        unreviewed_structured_error_rate=unreviewed_structured_error_rate(records),
-        unreviewed_category_error_rate=unreviewed_category_error_rate(records),
-        unreviewed_action_error_rate=unreviewed_action_error_rate(records),
-        review_load=review_load(records),
-        gate_recall=gate_recall(records),
-        gate_precision=gate_precision(records),
+        unreviewed_structured_error_rate=series[
+            "unreviewed_structured_error_rate"
+        ].rate,
+        unreviewed_category_error_rate=series["unreviewed_category_error_rate"].rate,
+        unreviewed_action_error_rate=series["unreviewed_action_error_rate"].rate,
+        review_load=series["review_load"].rate,
+        gate_recall=series["gate_recall"].rate,
+        gate_precision=series["gate_precision"].rate,
         category_confusion_matrix=matrix,
         category_class_metrics=category_class_metrics(matrix),
-        action_accuracy=action_accuracy(records),
+        action_accuracy=series["action_accuracy"].rate,
         refund_amount_error=refund_amount_error(records),
-        escalation_rate=escalation_rate(records),
-        invalid_output_rate=invalid_output_rate(records, events),
-        fallback_usage_rate=fallback_usage_rate(records, events),
-        unhelpful_outcome_rate=unhelpful_outcome_rate(records),
+        escalation_rate=series["escalation_rate"].rate,
+        invalid_output_rate=series["invalid_output_rate"].rate,
+        fallback_usage_rate=series["fallback_usage_rate"].rate,
+        unhelpful_outcome_rate=series["unhelpful_outcome_rate"].rate,
     )
 
 

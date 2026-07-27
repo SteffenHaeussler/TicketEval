@@ -1,3 +1,4 @@
+import ticketflow.eval.report as report
 from tests.eval.test_records import make_call_event, make_case_record, make_expected
 from ticketflow.eval.report import render_markdown
 from ticketflow.models import ApprovalDecision
@@ -30,6 +31,44 @@ def test_header_reports_scored_and_total_population():
     records = _minimal_records(n_scored=2, n_unscored=1)
     text = render_markdown(records, [], bootstrap_seed=1, n_resamples=50)
     assert "Scored population: 2 of 3 total cases" in text
+
+
+def test_dataset_composition_counts_unique_case_keys_not_repeats():
+    records = [
+        make_case_record(
+            case_key="easy-generated",
+            ticket_id="ticket-easy-0",
+            repeat_index=0,
+            difficulty="easy",
+            source="generated",
+        ),
+        make_case_record(
+            case_key="easy-generated",
+            ticket_id="ticket-easy-1",
+            repeat_index=1,
+            difficulty="easy",
+            source="generated",
+        ),
+        make_case_record(
+            case_key="adversarial-handwritten",
+            ticket_id="ticket-adversarial",
+            difficulty="adversarial",
+            source="handwritten",
+            expected=make_expected(
+                acceptable_categories=["technical"],
+                reference_category="technical",
+            ),
+            predicted_category="technical",
+        ),
+    ]
+
+    text = render_markdown(records, [], bootstrap_seed=1, n_resamples=50)
+
+    assert "## Dataset Composition" in text
+    assert "Unique cases: 2" in text
+    assert "Difficulty: easy 1, ambiguous 0, adversarial 1" in text
+    assert "Source: handwritten 1, generated 1" in text
+    assert "Reference category: billing 1, technical 1, account 0, general 0" in text
 
 
 def test_directional_only_banner_present_below_100_scored():
@@ -183,7 +222,7 @@ def test_confusion_matrix_and_per_class_metrics_render():
     assert "billing" in text and "technical" in text
     assert "Precision: 100.0% (CI [100.0%, 100.0%]) — 1/1 (predicted_billing)" in text
     assert "Recall: 50.0% (CI [" in text and "(reference_billing)" in text
-    assert "F1: 0.667" in text
+    assert "F1: 66.7% (CI [" in text and "2/3 (f1_2tp_plus_fp_plus_fn_billing)" in text
 
 
 # --- escalation & availability: visually separate block ---
@@ -228,19 +267,11 @@ def test_no_threshold_sweep_or_judge_sections():
     assert "judge" not in text.lower()
 
 
-# --- console alias ---
+# --- single renderer API ---
 
 
-def test_render_console_matches_render_markdown():
-    from ticketflow.eval.report import render_console
-
-    records = _minimal_records(n_scored=3, n_unscored=1)
-    events = [
-        make_call_event(case_key="scored-0", ticket_id="ticket-0", role="fallback")
-    ]
-    assert render_console(
-        records, events, bootstrap_seed=1, n_resamples=50
-    ) == render_markdown(records, events, bootstrap_seed=1, n_resamples=50)
+def test_report_exposes_only_the_markdown_renderer():
+    assert not hasattr(report, "render_console")
 
 
 # --- golden file ---
@@ -255,6 +286,13 @@ _GOLDEN_MARKDOWN = (
     "\n"
     "Excluded (no prediction): 1\n"
     "- agent exhausted repair budget: 1\n"
+    "\n"
+    "## Dataset Composition\n"
+    "\n"
+    "Unique cases: 6\n"
+    "Difficulty: easy 6, ambiguous 0, adversarial 0\n"
+    "Source: handwritten 6, generated 0\n"
+    "Reference category: billing 3, technical 1, account 1, general 1\n"
     "\n"
     "## Quality Metrics\n"
     "\n"
@@ -287,19 +325,23 @@ _GOLDEN_MARKDOWN = (
     "- **billing**\n"
     "  - Precision: 100.0% (CI [100.0%, 100.0%]) — 3/3 (predicted_billing)\n"
     "  - Recall: 100.0% (CI [100.0%, 100.0%]) — 3/3 (reference_billing)\n"
-    "  - F1: 1.000\n"
+    "  - F1: 100.0% (CI [100.0%, 100.0%]) — "
+    "6/6 (f1_2tp_plus_fp_plus_fn_billing)\n"
     "- **technical**\n"
     "  - Precision: n/a — 0/0 (predicted_technical)\n"
     "  - Recall: 0.0% (CI [0.0%, 0.0%]) — 0/1 (reference_technical)\n"
-    "  - F1: n/a\n"
+    "  - F1: 0.0% (CI [0.0%, 0.0%]) — "
+    "0/1 (f1_2tp_plus_fp_plus_fn_technical)\n"
     "- **account**\n"
     "  - Precision: 100.0% (CI [100.0%, 100.0%]) — 1/1 (predicted_account)\n"
     "  - Recall: 100.0% (CI [100.0%, 100.0%]) — 1/1 (reference_account)\n"
-    "  - F1: 1.000\n"
+    "  - F1: 100.0% (CI [100.0%, 100.0%]) — "
+    "2/2 (f1_2tp_plus_fp_plus_fn_account)\n"
     "- **general**\n"
     "  - Precision: 0.0% (CI [0.0%, 0.0%]) — 0/1 (predicted_general)\n"
     "  - Recall: n/a — 0/0 (reference_general)\n"
-    "  - F1: n/a\n"
+    "  - F1: 0.0% (CI [0.0%, 0.0%]) — "
+    "0/1 (f1_2tp_plus_fp_plus_fn_general)\n"
     "\n"
     "## Escalation & Availability\n"
     "\n"

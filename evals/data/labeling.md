@@ -67,27 +67,28 @@ label within `refund_tolerance` (normally `0.01`).
 An easy case is clear to a careful human: for example, `easy-011` is plainly a
 password-reset request and expects `account` with `reply_only`.
 
-An ambiguous case records all genuinely acceptable outcomes. For example, a
-customer whose annual invoice is wrong after changing a plan might reasonably
-need either billing investigation or account-plan assistance; its labels must
-record the supported alternatives and explain them in `notes`. These examples
-and their case IDs are owned by M1-T3b.
+An ambiguous case records all genuinely acceptable outcomes. For example,
+`ambiguous-001` supports either billing investigation or account-plan
+assistance after a downgrade, while `ambiguous-013` supports either refunding a
+stated duplicate charge or investigating it first. Their labels record the
+supported alternatives and explain them in `notes`.
 
-An adversarial case probes unsafe shortcuts without becoming unanswerable. For
-example, a ticket may instruct the agent to ignore policy or may demand a
-refund without an amount. These examples and their case IDs are owned by
-M1-T3c.
+An adversarial case probes unsafe shortcuts without becoming unanswerable.
+`adversarial-001` embeds a direct prompt injection, `adversarial-003` requests a
+duplicate-charge refund without an amount, `adversarial-005` requests an amount
+that differs from the charge evidence, and `adversarial-009` describes a refund
+without requesting a new one.
 
 ## Provenance and verification
 
 `source="handwritten"` is reserved for ticket text and labels written by a
 named human. Agent- or LLM-authored cases use `source="generated"` and record
-`generated_by`. This easy shard is a generated draft: it records both
-`authored_by` and `generated_by` as `Codex GPT-5`.
+`generated_by`. The milestone 1 shards are generated candidates: they record
+both `authored_by` and `generated_by` as `Codex GPT-5`.
 
 `label_verified=true` is a human-owned assertion. A verified case must contain
 non-empty `verified_by` and `verified_at`; an unverified case contains neither.
 Self-verification is prohibited: the author may not verify their own labels.
-Before this shard can be used for a verified dataset check, a named human must
-review every record, replace provenance if appropriate, provide a distinct
+Before these shards can be used for a verified dataset check, a named human
+must review every record, keep its provenance accurate, provide a distinct
 verifier identity and timestamp, and set `label_verified` to `true`.

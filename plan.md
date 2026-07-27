@@ -1,6 +1,6 @@
 # Ticketflow Eval Harness
 
-**Status:** revised plan, not started · **Date:** 2026-07-27
+**Status:** milestone 1 code complete; human dataset verification pending · **Date:** 2026-07-27
 
 ## Summary
 
@@ -150,9 +150,9 @@ calibration bundle needed to hand real replies between workspace branches.
 
 ```python
 class ExpectedOutcome(BaseModel):
-    acceptable_categories: set[TicketCategory]
+    acceptable_categories: frozenset[TicketCategory]
     reference_category: TicketCategory
-    acceptable_actions: set[ActionType]
+    acceptable_actions: frozenset[ActionType]
     expected_refund_amount: float | None = None
     refund_tolerance: float = 0.01
 
@@ -221,7 +221,8 @@ separators are not accepted. Every rejection names the offending case ID and sou
 
 ### Initial dataset
 
-Milestone 1 ships approximately 50 verified handwritten cases:
+Milestone 1 ships approximately 50 independently human-verified cases. Cases keep
+truthful provenance and may remain `source="generated"`:
 
 - 20 easy cases.
 - 20 ambiguous cases.
@@ -909,7 +910,7 @@ Deliver:
 - Immutable record models.
 - Deterministic structured scorers.
 - Clustered confidence intervals.
-- Basic Markdown and console reports.
+- A basic Markdown report that can be saved or printed directly to a console.
 - Exact synthetic tests.
 
 Acceptance:

@@ -1,6 +1,6 @@
 # Ticketflow Eval Harness — Execution Breakdown
 
-**Status:** not started · **Date:** 2026-07-27 · **Companion to:** [`plan.md`](./plan.md)
+**Status:** milestone 1 code complete; human dataset verification pending · **Date:** 2026-07-27 · **Companion to:** [`plan.md`](./plan.md)
 
 ## Purpose
 
@@ -191,37 +191,38 @@ currency and decimal rules in `plan.md`. Every rejection names the offending cas
 
 Write `evals/data/labeling.md` documenting the labelling policy from `plan.md` — when a refund is
 expected, how multiple acceptable outcomes are recorded, what verification means — with worked
-positive, negative, ambiguous, and adversarial examples. Then pause for a named human author to
-write 20 `difficulty="easy"` cases whose category and action are unambiguous. A different named
-human supplies `verified_by` and `verified_at` and changes `label_verified` to true. Agents may
-validate and format the completed shard but may not author cases labelled `source="handwritten"`.
+positive, negative, ambiguous, and adversarial examples. Prepare 20 `difficulty="easy"` candidates
+whose category and action are unambiguous, keeping `source` and generator provenance accurate. Then
+pause for a named human to review every case, supply `verified_by` and `verified_at`, and change
+`label_verified` to true. Agents may validate and format the completed shard but may not assert
+human verification or label generated text as `source="handwritten"`.
 
 **Acceptance**
 
-- The human-authored draft passes `load_cases(easy_path, require_verified=False)` before review.
-- After the second-human checkpoint, all 20 cases have distinct `authored_by` and `verified_by`,
-  `verified_at`, `label_verified=true`, and `source="handwritten"`.
+- The candidate shard passes `load_cases(easy_path, require_verified=False)` before review.
+- After the human checkpoint, all 20 cases have distinct `authored_by` and `verified_by`,
+  `verified_at`, `label_verified=true`, and truthful source/generator provenance.
 - Categories are spread across all four `TicketCategory` values.
 - Every guide rule is illustrated by at least one committed case, referenced by ID.
 
 ### M1-T3b — Ambiguous cases
 
-A named human writes 20 `difficulty="ambiguous"` cases — tickets where a competent agent could
-reasonably choose more than one category or action, recorded with multiple acceptable values rather
-than one arbitrary "right" answer. These are the cases that make `gate_recall` meaningful, so bias
-them toward outcomes near the confidence threshold rather than toward exotic phrasing.
+Prepare 20 `difficulty="ambiguous"` candidates — tickets where a competent agent could reasonably
+choose more than one category or action, recorded with multiple acceptable values rather than one
+arbitrary "right" answer. These are the cases that make `gate_recall` meaningful, so bias them
+toward outcomes near the confidence threshold rather than toward exotic phrasing.
 
 **Acceptance**
 
 - At least 12 cases carry more than one acceptable category or action.
 - Each case's `notes` field explains *why* it is ambiguous.
 - No case is ambiguous merely because it is badly written; ambiguity is about the support decision.
-- A second named human verifies every case before the task completes; agents only validate and
-  format the shard.
+- A named human distinct from the recorded author verifies every case before the task completes;
+  agents only prepare, validate, and format the shard.
 
 ### M1-T3c — Adversarial cases
 
-A named human writes 10 `difficulty="adversarial"` cases: prompt-injection attempts, refund requests with no
+Prepare 10 `difficulty="adversarial"` candidates: prompt-injection attempts, refund requests with no
 stated amount, refund requests for amounts not in the ticket, contradictory instructions, and
 tickets that describe a refund without requesting one. These exist to probe the refund rule and the
 gate, not to be unanswerable.
@@ -231,8 +232,8 @@ gate, not to be unanswerable.
 - At least three cases request a refund in a way that must *not* produce a `REFUND` action.
 - At least one case attempts to instruct the agent directly.
 - Each case's `notes` states the failure mode it targets.
-- A second named human verifies every case before the task completes; agents only validate and
-  format the shard.
+- A named human distinct from the recorded author verifies every case before the task completes;
+  agents only prepare, validate, and format the shard.
 
 ### M1-T4 — Immutable record models
 
@@ -299,11 +300,11 @@ never inflate apparent precision.
 
 ### M1-T7 — Report renderer
 
-Render the deterministic metrics to Markdown and to console. Every rate prints with its interval and
-its denominator name. Escalation and invalid-output rates render in a visually separate block from
-quality metrics. A run whose scored population is less than 100 is labelled *directional only* in
-the header, and the scored population size prints beside the total with a per-reason exclusion
-breakdown.
+Render the deterministic metrics to a Markdown string that can be saved or printed directly to a
+console. Every rate prints with its interval and its denominator name. Escalation and invalid-output
+rates render in a visually separate block from quality metrics. A run whose scored population is
+less than 100 is labelled *directional only* in the header, and the scored population size prints
+beside the total with a per-reason exclusion breakdown.
 
 **Acceptance**
 
@@ -324,7 +325,7 @@ validation failure. Add `make eval-dataset-check`.
 
 - `make eval-dataset-check` exits 0 on the committed dataset and non-zero on a deliberately broken
   shard, printing the offending case ID.
-- Before the human-authored dataset PR lands, equivalent fixture-based CLI tests pass; the wave
+- Before the human-reviewed dataset PR lands, equivalent fixture-based CLI tests pass; the wave
   integrator runs the committed-dataset command when closing milestone 1.
 - The subcommand structure accommodates `run`, `judge`, `report`, and `compare` without rework.
 - The script satisfies ruff's docstring rules (`scripts/` is not exempt).
@@ -947,7 +948,7 @@ Two files are contended across milestones and need care at merge time:
 | Judge-derived metrics appear only for validated dimensions | M4-T4a, M4-T4b, M4-T5, M4-T6, M4-T7 |
 | Stable case identity makes reviewer-policy outputs comparable | M2-T6, M2-T1, M3-T4, M3-T3 |
 | Production and CLI entrypoints cover every promised command | M3-T7, M4-T2, M4-T5, M4-T7 |
-| Verified labels and calibration ratings are human-authored | M1-T3a/b/c, M4-T1a/b/c, M4-T4b |
+| Verified labels and calibration ratings are human-reviewed | M1-T3a/b/c, M4-T1a/b/c, M4-T4b |
 
 `plan.md`'s repository-constraints table maps as follows: schedule-to-start fallback → M2-T5;
 heartbeat timeout → M3-T1; `TicketResult` omissions → M2-T4; import-time constants → M2-T2;
