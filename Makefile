@@ -1,4 +1,4 @@
-.PHONY: install install-hooks lint format-check format typecheck check test test-eval test-eval-ollama eval-ollama eval-dataset-check coverage smoke test-docker test-docker-tracing server server-docker up down logs stack-reset jaeger search-attributes worker llm-worker api doctor ticket status approve reject batch reset
+.PHONY: install install-hooks lint format-check format typecheck check test test-eval test-eval-ollama eval eval-ollama eval-dataset-check coverage smoke test-docker test-docker-tracing server server-docker up down logs stack-reset jaeger search-attributes worker llm-worker api doctor ticket status approve reject batch reset
 
 N ?= 100
 API_URL ?= http://localhost:8000
@@ -43,6 +43,9 @@ test-eval:
 
 test-eval-ollama:
 	uv run pytest -m ollama -o addopts=
+
+eval:
+	uv run python scripts/eval.py run --profile primary-quality --agent tunable --reviewer both --allow-unverified
 
 eval-ollama:
 	uv run python scripts/eval_ollama.py

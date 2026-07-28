@@ -1,6 +1,9 @@
 import json
+from datetime import datetime, timezone
 
 from scripts import eval as eval_cli
+from ticketflow.eval.records import CallEvent, CaseRecord, RecordsError, RunManifest
+from ticketflow.models import ActionType, TicketCategory
 
 
 def make_case(case_id, *, difficulty, source, reference_category, verified=True):
@@ -150,3 +153,159 @@ def test_parser_dispatches_dataset_check_to_its_handler(monkeypatch):
 
     assert eval_cli.main(["dataset-check"]) == 17
     assert len(calls) == 1
+
+
+def test_run_rejects_repeats_with_cache_before_starting_a_workflow(monkeypatch, capsys):
+    started = False
+
+    async def run_profile(_options):
+        nonlocal started
+        started = True
+        raise AssertionError("run_profile must not start")
+
+    monkeypatch.setattr(eval_cli, "run_profile", run_profile)
+
+    assert eval_cli.main(["run", "--profile", "primary-quality", "--repeats", "2"]) == 1
+    assert "--repeats=2 requires --no-cache" in capsys.readouterr().err
+    assert not started
+
+
+def test_run_rejects_reviewer_incompatible_with_profile(capsys):
+    result = eval_cli.main(
+        ["run", "--profile", "fallback-routing", "--reviewer", "both"]
+    )
+    assert result == 1
+    assert "fallback-routing requires --reviewer oracle" in capsys.readouterr().err
+
+
+def test_run_writes_profile_artifacts_and_supports_authoring_dataset(
+    tmp_path, monkeypatch, capsys
+):
+    dataset = write_shard(
+        tmp_path,
+        "draft.jsonl",
+        [
+            make_case(
+                "draft-1",
+                difficulty="easy",
+                source="handwritten",
+                reference_category="billing",
+                verified=False,
+            )
+        ],
+    )
+    artifacts_root = tmp_path / "runs"
+    observed = {}
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    async def run_profile(options):
+        observed["options"] = options
+        manifest = RunManifest(
+            run_id="run-cli-test",
+            git_commit="abc123",
+            git_dirty=False,
+            dataset_path=str(dataset),
+            dataset_sha256="hash",
+            agent_backend="tunable",
+            run_profile="primary-quality",
+            primary_model="tunable-primary",
+            python_version="3.12.0",
+            reviewer_policies=["oracle", "rubber_stamp"],
+            cache_enabled=True,
+            confidence_threshold=0.75,
+            agent_task_queue="agent",
+            fallback_task_queue="fallback",
+            agent_schedule_to_start_s=30.0,
+            agent_activity_timeout_s=60.0,
+            agent_heartbeat_timeout_s=30.0,
+            seed=0,
+            bootstrap_seed=0,
+            concurrency=8,
+            repeats=1,
+            started_at=now,
+            finished_at=now,
+        )
+        record = CaseRecord(
+            run_id=manifest.run_id,
+            policy="oracle",
+            case_key="draft-1",
+            repeat_index=0,
+            ticket_id="ticket-1",
+            difficulty="easy",
+            source="handwritten",
+            expected=options.cases[0].expected,
+            predicted_category=TicketCategory.BILLING,
+            predicted_action=ActionType.REPLY_ONLY,
+            classification_confidence=0.9,
+            draft_confidence=0.9,
+            reply_text="Resolved.",
+            prediction_available=True,
+            terminal_outcome="resolved",
+            end_to_end_latency_ms=1.0,
+        )
+        event = CallEvent(
+            run_id=manifest.run_id,
+            case_key="draft-1",
+            ticket_id="ticket-1",
+            policy="oracle",
+            repeat_index=0,
+            operation="classify",
+            role="primary",
+            attempt=1,
+            cache_hit=False,
+            started_at=now,
+            wall_latency_ms=1.0,
+            model_total_duration_ms=None,
+            model_load_duration_ms=None,
+            outcome="success",
+            error_type=None,
+        )
+        return manifest, [record], [event]
+
+    monkeypatch.setattr(eval_cli, "DEFAULT_DATASET_DIR", dataset)
+    monkeypatch.setattr(eval_cli, "RUNS_DIR", artifacts_root)
+    monkeypatch.setattr(eval_cli, "run_profile", run_profile)
+
+    original_write_call_events = eval_cli.write_call_events
+
+    def fail_call_events(*_args):
+        raise RecordsError("injected calls write failure")
+
+    monkeypatch.setattr(eval_cli, "write_call_events", fail_call_events)
+    assert (
+        eval_cli.main(
+            [
+                "run",
+                "--profile",
+                "primary-quality",
+                "--allow-unverified",
+                "--limit",
+                "1",
+            ]
+        )
+        == 1
+    )
+    assert not (artifacts_root / "run-cli-test").exists()
+    assert "injected calls write failure" in capsys.readouterr().err
+
+    monkeypatch.setattr(eval_cli, "write_call_events", original_write_call_events)
+    assert (
+        eval_cli.main(
+            [
+                "run",
+                "--profile",
+                "primary-quality",
+                "--allow-unverified",
+                "--limit",
+                "1",
+            ]
+        )
+        == 0
+    )
+
+    run_dir = artifacts_root / "run-cli-test"
+    assert observed["options"].cases[0].id == "draft-1"
+    assert (run_dir / "manifest.json").is_file()
+    assert (run_dir / "records.jsonl").is_file()
+    assert (run_dir / "calls.jsonl").is_file()
+    assert capsys.readouterr().out == f"run_id: run-cli-test\nartifacts: {run_dir}\n"
