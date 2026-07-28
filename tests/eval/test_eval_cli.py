@@ -2,7 +2,19 @@ import json
 from datetime import datetime, timezone
 
 from scripts import eval as eval_cli
-from ticketflow.eval.records import CallEvent, CaseRecord, RecordsError, RunManifest
+from ticketflow.eval.dataset import EvalCase
+from ticketflow.eval.invariants import InvariantReport
+from ticketflow.eval.profiles import ProfileConfigError
+from ticketflow.eval.records import (
+    CallEvent,
+    CaseRecord,
+    RecordsError,
+    RunManifest,
+    read_call_events,
+    read_case_records,
+    read_json_artifact,
+    read_run_manifest,
+)
 from ticketflow.models import ActionType, TicketCategory
 
 
@@ -155,6 +167,61 @@ def test_parser_dispatches_dataset_check_to_its_handler(monkeypatch):
     assert len(calls) == 1
 
 
+def test_run_drives_the_committed_dataset_end_to_end(tmp_path, monkeypatch, capsys):
+    """M2-T7: `make eval` completes a real tunable run over the committed dataset.
+
+    Deliberately does not stub run_profile -- this is the only test that exercises
+    the CLI, the profile assembly, the Temporal test server, and artifact writing
+    together against evals/data/tickets. Limited to a few cases for runtime.
+    """
+    artifacts_root = tmp_path / "runs"
+    monkeypatch.setattr(eval_cli, "RUNS_DIR", artifacts_root)
+
+    exit_code = eval_cli.main(
+        [
+            "run",
+            "--profile",
+            "primary-quality",
+            "--agent",
+            "tunable",
+            "--reviewer",
+            "both",
+            "--allow-unverified",
+            "--limit",
+            "3",
+            "--concurrency",
+            "2",
+        ]
+    )
+    assert exit_code == 0
+
+    out = capsys.readouterr().out
+    assert "invariants: ok" in out
+
+    run_dirs = list(artifacts_root.iterdir())
+    assert len(run_dirs) == 1
+    run_dir = run_dirs[0]
+
+    manifest = read_run_manifest(run_dir / "manifest.json")
+    assert manifest.run_profile == "primary-quality"
+    assert manifest.reviewer_policies == ["oracle", "rubber_stamp"]
+    assert manifest.dataset_path == str(eval_cli.DEFAULT_DATASET_DIR)
+    assert manifest.generation_seed_rule
+
+    # Three cases under both reviewer policies.
+    records = read_case_records(run_dir / "records.jsonl")
+    assert len(records) == 6
+    assert {record.policy for record in records} == {"oracle", "rubber_stamp"}
+    assert all(record.prediction_available for record in records)
+
+    events = read_call_events(run_dir / "calls.jsonl")
+    assert {event.operation for event in events} == {"classify", "draft"}
+
+    invariants = read_json_artifact(run_dir / "invariants.json", InvariantReport)
+    assert invariants.ok
+    assert invariants.total_checked == 6
+
+
 def test_run_rejects_repeats_with_cache_before_starting_a_workflow(monkeypatch, capsys):
     started = False
 
@@ -175,7 +242,78 @@ def test_run_rejects_reviewer_incompatible_with_profile(capsys):
         ["run", "--profile", "fallback-routing", "--reviewer", "both"]
     )
     assert result == 1
-    assert "fallback-routing requires --reviewer oracle" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "does not support reviewer 'rubber_stamp'" in err
+    assert "it allows oracle" in err
+
+
+def test_run_accepts_a_reviewer_narrowing_a_quality_profile(tmp_path, monkeypatch):
+    # --reviewer oracle is a legal subset of primary-quality's two policies, and must
+    # reach RunOptions rather than being validated and then dropped.
+    observed = {}
+
+    async def run_profile(options):
+        observed["options"] = options
+        raise ProfileConfigError("stop after options are built")
+
+    monkeypatch.setattr(eval_cli, "run_profile", run_profile)
+
+    assert (
+        eval_cli.main(
+            [
+                "run",
+                "--profile",
+                "primary-quality",
+                "--reviewer",
+                "oracle",
+                "--allow-unverified",
+                "--limit",
+                "1",
+            ]
+        )
+        == 1
+    )
+    assert observed["options"].reviewer_policies == ("oracle",)
+
+
+def test_run_rejects_schedule_to_start_at_or_above_case_deadline(capsys):
+    result = eval_cli.main(
+        [
+            "run",
+            "--profile",
+            "fallback-routing",
+            "--schedule-to-start",
+            "60",
+            "--case-deadline",
+            "60",
+        ]
+    )
+    assert result == 1
+    assert "must be below --case-deadline=60.0" in capsys.readouterr().err
+
+
+def test_limit_samples_across_difficulties_instead_of_head_slicing():
+    def case(case_id, difficulty):
+        return EvalCase.model_validate(
+            make_case(
+                case_id,
+                difficulty=difficulty,
+                source="generated",
+                reference_category="billing",
+            )
+        )
+
+    # Mirrors the real shard order: adversarial sorts first, so a head slice would
+    # return only adversarial cases.
+    cases = [case(f"adversarial-{i}", "adversarial") for i in range(3)] + [
+        case(f"easy-{i}", "easy") for i in range(3)
+    ]
+
+    selected = eval_cli._limited_cases(cases, 2)
+
+    assert {case.difficulty for case in selected} == {"adversarial", "easy"}
+    # Dataset order is preserved so artifacts stay diffable.
+    assert [case.id for case in selected] == ["adversarial-0", "easy-0"]
 
 
 def test_run_writes_profile_artifacts_and_supports_authoring_dataset(
@@ -220,6 +358,7 @@ def test_run_writes_profile_artifacts_and_supports_authoring_dataset(
             agent_heartbeat_timeout_s=30.0,
             seed=0,
             bootstrap_seed=0,
+            generation_seed_rule="test-rule/v1",
             concurrency=8,
             repeats=1,
             started_at=now,
@@ -308,4 +447,10 @@ def test_run_writes_profile_artifacts_and_supports_authoring_dataset(
     assert (run_dir / "manifest.json").is_file()
     assert (run_dir / "records.jsonl").is_file()
     assert (run_dir / "calls.jsonl").is_file()
-    assert capsys.readouterr().out == f"run_id: run-cli-test\nartifacts: {run_dir}\n"
+    assert (run_dir / "invariants.json").is_file()
+    assert capsys.readouterr().out == (
+        f"run_id: run-cli-test\n"
+        f"artifacts: {run_dir}\n"
+        f"cases: 1 records, 1 call events\n"
+        f"invariants: ok (1 records checked)\n"
+    )

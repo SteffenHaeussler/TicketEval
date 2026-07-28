@@ -112,6 +112,7 @@ def make_manifest(**overrides):
         agent_heartbeat_timeout_s=10.0,
         seed=0,
         bootstrap_seed=0,
+        generation_seed_rule="test-rule/v1",
         concurrency=4,
         repeats=1,
         started_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
