@@ -603,12 +603,14 @@ def test_manifest_provenance_submodels_are_frozen_and_schema_constrained():
             setattr(model, field, replacement)
 
     with pytest.raises(ValidationError):
-        PreflightMeasurement(
-            operation="other",
-            ticket_id="probe-1",
-            wall_latency_s=1.2,
-            load_duration_s=None,
-            generation_duration_s=None,
+        PreflightMeasurement.model_validate(
+            {
+                "operation": "other",
+                "ticket_id": "probe-1",
+                "wall_latency_s": 1.2,
+                "load_duration_s": None,
+                "generation_duration_s": None,
+            }
         )
 
 
@@ -633,7 +635,7 @@ def test_preflight_measurement_rejects_negative_or_non_finite_durations(field, v
     )
     values[field] = value
     with pytest.raises(ValidationError, match=field):
-        PreflightMeasurement(**values)
+        PreflightMeasurement.model_validate(values)
 
 
 @pytest.mark.parametrize(
@@ -656,7 +658,7 @@ def test_timeout_adjustment_rejects_invalid_timeout_values(field, value):
     )
     values[field] = value
     with pytest.raises(ValidationError, match=field):
-        TimeoutAdjustment(**values)
+        TimeoutAdjustment.model_validate(values)
 
 
 def test_timeout_adjustment_requires_http_timeout_to_exclude_safety_margin():

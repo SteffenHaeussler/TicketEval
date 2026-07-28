@@ -15,7 +15,7 @@ import platform
 import subprocess
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractAsyncContextManager
+from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,7 +24,11 @@ from typing import Literal, NamedTuple
 from temporalio.client import Client
 from temporalio.testing import WorkflowEnvironment
 
+from ticketflow.agent.base import Agent
+from ticketflow.agent.ollama import OllamaAgent
+from ticketflow.agent.prompts import CLASSIFICATION_SPEC, DRAFT_SPEC
 from ticketflow.agent.tunable import TunableAgentProfile, TunableMockAgent
+from ticketflow.eval.cache import ResponseCache
 from ticketflow.eval.dataset import EvalCase, ExpectedOutcome
 from ticketflow.eval.harness import (
     CombinedWorker,
@@ -36,7 +40,15 @@ from ticketflow.eval.harness import (
     patched_workflow_constants,
     time_skipping_environment,
 )
-from ticketflow.eval.records import CallEvent, CaseRecord, RunManifest
+from ticketflow.eval.preflight import PreflightResult
+from ticketflow.eval.records import (
+    CallEvent,
+    CaseRecord,
+    GenerationSettings,
+    PreflightMeasurement,
+    RunManifest,
+    TimeoutAdjustment,
+)
 from ticketflow.eval.reviewers import oracle, rubber_stamp
 from ticketflow.eval.runner import CaseRunner, Reviewer
 from ticketflow.eval.telemetry import RuntimeIdentityMap, TelemetrySink
@@ -46,7 +58,7 @@ RunProfile = Literal[
 ]
 
 _REVIEWERS: dict[str, Reviewer] = {"oracle": oracle, "rubber_stamp": rubber_stamp}
-_DEPENDENCY_NAMES = ("temporalio", "pydantic")
+_DEPENDENCY_NAMES = ("temporalio", "pydantic", "httpx")
 
 # Recorded in every manifest so an old run stays reproducible if derive_generation_seed
 # ever changes. Bump the version suffix whenever that function's output changes.
@@ -198,6 +210,9 @@ class RunOptions:
     agent_backend: Literal["tunable", "mock", "ollama"] = "tunable"
     primary_model: str = "tunable-primary"
     fallback_model: str | None = "tunable-fallback"
+    ollama_endpoint: str | None = None
+    preflight_result: PreflightResult | None = None
+    response_cache: ResponseCache | None = None
     run_id: str = field(default_factory=lambda: f"run-{uuid.uuid4().hex}")
     seed: int = 0
     bootstrap_seed: int = 0
@@ -227,12 +242,14 @@ class RunOptions:
             )
         if not self.cases:
             raise ProfileConfigError("cases must not be empty")
-        if self.agent_backend != "tunable":
+        if self.agent_backend not in ("tunable", "ollama"):
             raise ProfileConfigError(
                 f"agent_backend {self.agent_backend!r} is not supported by "
-                "run_profile(); only 'tunable' is implemented"
+                "run_profile(); supported backends are 'tunable' and 'ollama'"
             )
         if (
+            self.agent_backend == "tunable"
+            and
             self.profile in ("fallback-quality", "fallback-routing")
             and self.fallback_agent_profile is None
         ):
@@ -243,8 +260,37 @@ class RunOptions:
             raise ProfileConfigError(
                 f"schedule_to_start_s must be > 0, got {self.schedule_to_start_s}"
             )
+        if self.agent_backend == "ollama":
+            self._validate_ollama_preflight()
         # Raises for a selection the profile does not allow, before any I/O.
         resolve_reviewer_policies(self.profile, self.reviewer_policies)
+
+    def _validate_ollama_preflight(self) -> None:
+        """Require preflight provenance that matches this real-model profile."""
+        if self.preflight_result is None:
+            raise ProfileConfigError("ollama runs require a completed preflight_result")
+        if self.ollama_endpoint is None:
+            raise ProfileConfigError("ollama runs require an ollama_endpoint")
+
+        models = {model.role: model for model in self.preflight_result.models}
+        primary = models.get("primary")
+        if primary is None or primary.name != self.primary_model:
+            raise ProfileConfigError(
+                "ollama preflight primary model does not match primary_model"
+            )
+        if self.fallback_model is not None:
+            fallback = models.get("fallback")
+            if fallback is None or fallback.name != self.fallback_model:
+                raise ProfileConfigError(
+                    "ollama preflight fallback model does not match fallback_model"
+                )
+        if (
+            self.profile in ("fallback-quality", "fallback-routing")
+            and self.fallback_model is None
+        ):
+            raise ProfileConfigError(
+                f"profile {self.profile!r} requires fallback_model for ollama"
+            )
 
 
 def _tunable_agent(
@@ -266,6 +312,39 @@ def _tunable_agent(
     )
 
 
+def _ollama_agent(
+    options: RunOptions,
+    *,
+    role: Literal["primary", "fallback"],
+    identity_map: RuntimeIdentityMap,
+    telemetry_sink: TelemetrySink,
+    generation_seed: int,
+    cache_enabled: bool,
+) -> OllamaAgent:
+    """Build one real-model agent from preflight-confirmed run provenance."""
+    assert options.preflight_result is not None
+    assert options.ollama_endpoint is not None
+    model_name = options.primary_model if role == "primary" else options.fallback_model
+    assert model_name is not None
+    model_info = next(
+        model
+        for model in options.preflight_result.models
+        if model.role == role and model.name == model_name
+    )
+    return OllamaAgent(
+        endpoint=options.ollama_endpoint,
+        model=model_name,
+        timeout_s=options.preflight_result.timeout_adjustment.http_timeout_s,
+        seed=generation_seed,
+        role=role,
+        response_cache=options.response_cache if cache_enabled else None,
+        identity_map=identity_map if cache_enabled else None,
+        telemetry_sink=telemetry_sink,
+        model_digest=model_info.digest,
+        ollama_version=options.preflight_result.ollama_version,
+    )
+
+
 def _build_workers_for_profile(
     *,
     profile: RunProfile,
@@ -279,58 +358,101 @@ def _build_workers_for_profile(
     fallback_agent_profile: TunableAgentProfile | None,
     generation_seed: int,
     db_path: str | None,
-) -> CombinedWorker:
+    options: RunOptions,
+    cache_enabled: bool,
+) -> tuple[CombinedWorker, tuple[OllamaAgent, ...]]:
     """Build one repeat's agent(s) and task-queue topology for profile."""
     if profile == "fallback-routing":
-        if fallback_agent_profile is None:
+        if options.agent_backend == "tunable" and fallback_agent_profile is None:
             raise ProfileConfigError(
                 f"profile {profile!r} requires fallback_agent_profile"
             )
-        fallback_agent = _tunable_agent(
-            fallback_agent_profile,
-            role="fallback",
-            identity_map=identity_map,
-            telemetry_sink=telemetry_sink,
-            expected_outcomes=expected_outcomes,
-            generation_seed=generation_seed,
-        )
+        if options.agent_backend == "ollama":
+            fallback_agent: Agent = _ollama_agent(
+                options,
+                role="fallback",
+                identity_map=identity_map,
+                telemetry_sink=telemetry_sink,
+                generation_seed=generation_seed,
+                cache_enabled=cache_enabled,
+            )
+            managed_agents = (fallback_agent,)
+        else:
+            assert fallback_agent_profile is not None
+            fallback_agent = _tunable_agent(
+                fallback_agent_profile,
+                role="fallback",
+                identity_map=identity_map,
+                telemetry_sink=telemetry_sink,
+                expected_outcomes=expected_outcomes,
+                generation_seed=generation_seed,
+            )
+            managed_agents = ()
         workflow_worker = make_workflow_worker(
             client, workflow_queue, fallback_agent, db_path=db_path
         )
         fallback_worker = make_agent_worker(
             client, fallback_agent, config.fallback_task_queue
         )
-        return CombinedWorker(workflow_worker, fallback_worker)
+        return CombinedWorker(workflow_worker, fallback_worker), managed_agents
 
     if profile == "fallback-quality":
-        if fallback_agent_profile is None:
+        if options.agent_backend == "tunable" and fallback_agent_profile is None:
             raise ProfileConfigError(
                 f"profile {profile!r} requires fallback_agent_profile"
             )
-        agent: TunableMockAgent = _tunable_agent(
-            fallback_agent_profile,
-            role="fallback",
-            identity_map=identity_map,
-            telemetry_sink=telemetry_sink,
-            expected_outcomes=expected_outcomes,
-            generation_seed=generation_seed,
-        )
+        if options.agent_backend == "ollama":
+            agent: Agent = _ollama_agent(
+                options,
+                role="fallback",
+                identity_map=identity_map,
+                telemetry_sink=telemetry_sink,
+                generation_seed=generation_seed,
+                cache_enabled=cache_enabled,
+            )
+            managed_agents = (agent,)
+        else:
+            assert fallback_agent_profile is not None
+            agent = _tunable_agent(
+                fallback_agent_profile,
+                role="fallback",
+                identity_map=identity_map,
+                telemetry_sink=telemetry_sink,
+                expected_outcomes=expected_outcomes,
+                generation_seed=generation_seed,
+            )
+            managed_agents = ()
     else:
-        agent = _tunable_agent(
-            primary_agent_profile,
-            role="primary",
-            identity_map=identity_map,
-            telemetry_sink=telemetry_sink,
-            expected_outcomes=expected_outcomes,
-            generation_seed=generation_seed,
-        )
+        if options.agent_backend == "ollama":
+            agent = _ollama_agent(
+                options,
+                role="primary",
+                identity_map=identity_map,
+                telemetry_sink=telemetry_sink,
+                generation_seed=generation_seed,
+                cache_enabled=cache_enabled,
+            )
+            managed_agents = (agent,)
+        else:
+            agent = _tunable_agent(
+                primary_agent_profile,
+                role="primary",
+                identity_map=identity_map,
+                telemetry_sink=telemetry_sink,
+                expected_outcomes=expected_outcomes,
+                generation_seed=generation_seed,
+            )
+            managed_agents = ()
 
-    return make_run_workers(
-        client,
-        workflow_eval_config=config,
-        workflow_task_queue=workflow_queue,
-        primary_agent=agent,
-        db_path=db_path,
+    return (
+        make_run_workers(
+            client,
+            workflow_eval_config=config,
+            workflow_task_queue=workflow_queue,
+            primary_agent=agent,
+            db_path=db_path,
+        ),
+        managed_agents,
     )
 
 
@@ -366,13 +488,18 @@ async def run_profile(
     git = git_info()
     dataset_hash = dataset_sha256(options.dataset_path)
 
+    if options.agent_backend == "ollama":
+        assert options.preflight_result is not None
+        base_config = options.preflight_result.workflow_eval_config
+    else:
+        base_config = current_workflow_eval_config()
     config_update: dict[str, object] = {
         "agent_task_queue": f"eval-{options.run_id}-agent",
         "fallback_task_queue": f"eval-{options.run_id}-fallback",
     }
     if options.schedule_to_start_s is not None:
         config_update["agent_schedule_to_start_s"] = options.schedule_to_start_s
-    config = current_workflow_eval_config().model_copy(update=config_update)
+    config = base_config.model_copy(update=config_update)
     workflow_queue = f"eval-{options.run_id}-workflow"
     reviewer_policies = resolve_reviewer_policies(
         options.profile, options.reviewer_policies
@@ -380,6 +507,10 @@ async def run_profile(
     effective_cache_enabled = _effective_cache_enabled(
         options.profile, options.cache_enabled
     )
+    if options.agent_backend == "ollama":
+        effective_cache_enabled = (
+            effective_cache_enabled and options.response_cache is not None
+        )
     expected_outcomes = {case.id: case.expected for case in options.cases}
 
     identity_map = RuntimeIdentityMap()
@@ -409,7 +540,7 @@ async def run_profile(
         with patched_workflow_constants(config), env.auto_time_skipping_disabled():
             for repeat_index in range(options.repeats):
                 generation_seed = derive_generation_seed(options.seed, repeat_index)
-                workers = _build_workers_for_profile(
+                workers, managed_agents = _build_workers_for_profile(
                     profile=options.profile,
                     client=env.client,
                     config=config,
@@ -421,48 +552,98 @@ async def run_profile(
                     fallback_agent_profile=options.fallback_agent_profile,
                     generation_seed=generation_seed,
                     db_path=options.db_path,
+                    options=options,
+                    cache_enabled=effective_cache_enabled,
                 )
-                async with workers:
-                    for policy in reviewer_policies:
-                        records, events = await _run_policy(
-                            runner,
-                            options.cases,
-                            policy=policy,
-                            reviewer=_REVIEWERS[policy],
-                            repeat_index=repeat_index,
-                            concurrency=options.concurrency,
-                        )
-                        all_records.extend(records)
-                        all_events.extend(events)
+                async with AsyncExitStack() as stack:
+                    for agent in managed_agents:
+                        await stack.enter_async_context(agent)
+                    async with workers:
+                        for policy in reviewer_policies:
+                            records, events = await _run_policy(
+                                runner,
+                                options.cases,
+                                policy=policy,
+                                reviewer=_REVIEWERS[policy],
+                                repeat_index=repeat_index,
+                                concurrency=options.concurrency,
+                            )
+                            all_records.extend(records)
+                            all_events.extend(events)
 
     finished_at = datetime.now(timezone.utc)
 
-    manifest = RunManifest(
-        run_id=options.run_id,
-        git_commit=git.commit,
-        git_dirty=git.dirty,
-        dataset_path=str(options.dataset_path),
-        dataset_sha256=dataset_hash,
-        agent_backend=options.agent_backend,
-        run_profile=options.profile,
-        primary_model=options.primary_model,
-        fallback_model=options.fallback_model,
-        python_version=platform.python_version(),
-        dependency_versions=_dependency_versions(),
-        reviewer_policies=reviewer_policies,
-        cache_enabled=effective_cache_enabled,
-        confidence_threshold=config.confidence_threshold,
-        agent_task_queue=config.agent_task_queue,
-        fallback_task_queue=config.fallback_task_queue,
-        agent_schedule_to_start_s=config.agent_schedule_to_start_s,
-        agent_activity_timeout_s=config.agent_activity_timeout_s,
-        agent_heartbeat_timeout_s=config.agent_heartbeat_timeout_s,
-        seed=options.seed,
-        bootstrap_seed=options.bootstrap_seed,
-        generation_seed_rule=GENERATION_SEED_RULE,
-        concurrency=options.concurrency,
-        repeats=options.repeats,
-        started_at=started_at,
-        finished_at=finished_at,
-    )
+    manifest_data: dict[str, object] = {
+        "run_id": options.run_id,
+        "git_commit": git.commit,
+        "git_dirty": git.dirty,
+        "dataset_path": str(options.dataset_path),
+        "dataset_sha256": dataset_hash,
+        "agent_backend": options.agent_backend,
+        "run_profile": options.profile,
+        "primary_model": options.primary_model,
+        "fallback_model": options.fallback_model,
+        "python_version": platform.python_version(),
+        "dependency_versions": _dependency_versions(),
+        "reviewer_policies": reviewer_policies,
+        "cache_enabled": effective_cache_enabled,
+        "confidence_threshold": config.confidence_threshold,
+        "agent_task_queue": config.agent_task_queue,
+        "fallback_task_queue": config.fallback_task_queue,
+        "agent_schedule_to_start_s": config.agent_schedule_to_start_s,
+        "agent_activity_timeout_s": config.agent_activity_timeout_s,
+        "agent_heartbeat_timeout_s": config.agent_heartbeat_timeout_s,
+        "seed": options.seed,
+        "bootstrap_seed": options.bootstrap_seed,
+        "generation_seed_rule": GENERATION_SEED_RULE,
+        "concurrency": options.concurrency,
+        "repeats": options.repeats,
+        "started_at": started_at,
+        "finished_at": finished_at,
+    }
+    if options.agent_backend == "ollama":
+        assert options.preflight_result is not None
+        model_digests = {
+            model.role: model.digest for model in options.preflight_result.models
+        }
+        adjustment = options.preflight_result.timeout_adjustment
+        manifest_data.update(
+            {
+            "primary_model_digest": model_digests["primary"],
+            "fallback_model_digest": model_digests.get("fallback"),
+            "ollama_version": options.preflight_result.ollama_version,
+            "prompt_hashes": {
+                CLASSIFICATION_SPEC.operation: CLASSIFICATION_SPEC.prompt_hash,
+                DRAFT_SPEC.operation: DRAFT_SPEC.prompt_hash,
+            },
+            "schema_hashes": {
+                CLASSIFICATION_SPEC.operation: CLASSIFICATION_SPEC.schema_hash,
+                DRAFT_SPEC.operation: DRAFT_SPEC.schema_hash,
+            },
+            "generation_settings": GenerationSettings(
+                stream=False,
+                think=False,
+                temperature=0.0,
+            ),
+            "preflight_measurements": tuple(
+                PreflightMeasurement(
+                    operation=measurement.operation,
+                    ticket_id=measurement.ticket_id,
+                    wall_latency_s=measurement.wall_latency_s,
+                    load_duration_s=measurement.load_duration_s,
+                    generation_duration_s=measurement.generation_duration_s,
+                )
+                for measurement in options.preflight_result.measurements
+            ),
+            "timeout_adjustment": TimeoutAdjustment(
+                configured_activity_timeout_s=adjustment.configured_activity_timeout_s,
+                slowest_observed_stage_s=adjustment.slowest_observed_stage_s,
+                effective_activity_timeout_s=adjustment.effective_activity_timeout_s,
+                safety_margin_s=adjustment.safety_margin_s,
+                http_timeout_s=adjustment.http_timeout_s,
+            ),
+            }
+        )
+
+    manifest = RunManifest.model_validate(manifest_data)
     return manifest, all_records, all_events

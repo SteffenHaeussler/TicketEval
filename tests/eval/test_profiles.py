@@ -1,17 +1,31 @@
+import json
 import platform
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, get_args
 
+import httpx
 import pytest
 
 from ticketflow import workflows
+from ticketflow.agent.ollama import OllamaAgent
+from ticketflow.agent.prompts import CLASSIFICATION_SPEC
 from ticketflow.agent.tunable import TunableAgentProfile
 from ticketflow.eval import profiles
+from ticketflow.eval.cache import FileResponseCache
 from ticketflow.eval.dataset import EvalCase, ExpectedOutcome
 from ticketflow.eval.harness import current_workflow_eval_config
 from ticketflow.eval.invariants import check_all_invariants
+from ticketflow.eval.preflight import (
+    ConfidenceGateResult,
+    ModelInfo,
+    PreflightResult,
+    StageMeasurement,
+)
+from ticketflow.eval.preflight import (
+    TimeoutAdjustment as PreflightTimeoutAdjustment,
+)
 from ticketflow.eval.profiles import (
     GitInfo,
     ProfileConfigError,
@@ -72,6 +86,52 @@ def _options(
     )
     defaults.update(overrides)
     return RunOptions(**defaults)
+
+
+def _preflight_result(
+    *, primary_model: str = "primary-model", fallback_model: str = "fallback-model"
+) -> PreflightResult:
+    adjustment = PreflightTimeoutAdjustment(
+        configured_activity_timeout_s=30.0,
+        slowest_observed_stage_s=20.0,
+        effective_activity_timeout_s=60.0,
+        safety_margin_s=6.0,
+        http_timeout_s=54.0,
+    )
+    return PreflightResult(
+        ollama_version="0.6.2",
+        models=(
+            ModelInfo(role="primary", name=primary_model, digest="sha256:primary"),
+            ModelInfo(role="fallback", name=fallback_model, digest="sha256:fallback"),
+        ),
+        measurements=(
+            StageMeasurement(
+                operation="classify",
+                ticket_id="probe-1",
+                wall_latency_s=1.0,
+                load_duration_s=0.25,
+                generation_duration_s=0.75,
+            ),
+            StageMeasurement(
+                operation="draft",
+                ticket_id="probe-1",
+                wall_latency_s=2.0,
+                load_duration_s=0.5,
+                generation_duration_s=1.5,
+            ),
+        ),
+        timeout_adjustment=adjustment,
+        confidence_gate=ConfidenceGateResult(
+            samples=(0.5, 0.6, 0.7, 0.8, 0.9),
+            std_dev=0.1,
+            distinct_count=5,
+            passes_std_dev_gate=True,
+            passes_distinctness_gate=True,
+        ),
+        workflow_eval_config=current_workflow_eval_config().model_copy(
+            update={"agent_activity_timeout_s": adjustment.effective_activity_timeout_s}
+        ),
+    )
 
 
 def _fake_git(commit: str, porcelain: str):
@@ -146,6 +206,32 @@ def test_run_options_rejects_non_tunable_agent_backend():
             cases=[_case("case-1")],
             primary_agent_profile=TunableAgentProfile(),
             agent_backend="mock",
+        )
+
+
+def test_run_options_requires_completed_preflight_for_ollama():
+    with pytest.raises(ProfileConfigError, match="preflight"):
+        RunOptions(
+            profile="primary-quality",
+            dataset_path="unused",
+            cases=[_case("case-1")],
+            primary_agent_profile=TunableAgentProfile(),
+            agent_backend="ollama",
+        )
+
+
+def test_run_options_rejects_ollama_preflight_for_a_different_primary_model():
+    with pytest.raises(ProfileConfigError, match="primary model"):
+        RunOptions(
+            profile="primary-quality",
+            dataset_path="unused",
+            cases=[_case("case-1")],
+            primary_agent_profile=TunableAgentProfile(),
+            agent_backend="ollama",
+            primary_model="configured-primary",
+            fallback_model="fallback-model",
+            ollama_endpoint="http://ollama.test",
+            preflight_result=_preflight_result(primary_model="preflight-primary"),
         )
 
 
@@ -438,3 +524,126 @@ async def test_run_profile_manifest_assembly_correctness(tmp_path):
     assert manifest.dataset_path == str(dataset_path)
     assert manifest.dataset_sha256 == dataset_sha256(dataset_path)
     assert manifest.python_version == platform.python_version()
+
+
+# -- Ollama profile integration -------------------------------------------------------
+
+
+def _ollama_response(request: httpx.Request) -> httpx.Response:
+    payload = json.loads(request.content)
+    system_prompt = payload["messages"][0]["content"]
+    if system_prompt == CLASSIFICATION_SPEC.system_prompt:
+        content = {"category": "billing", "confidence": 0.9}
+    else:
+        content = {
+            "reply_text": "Thanks for reaching out.",
+            "action": {"type": "reply_only"},
+            "confidence": 0.8,
+        }
+    return httpx.Response(
+        200,
+        json={
+            "message": {"content": json.dumps(content)},
+            "total_duration": 100_000_000,
+            "load_duration": 20_000_000,
+        },
+        request=request,
+    )
+
+
+async def test_ollama_primary_profile_uses_preflight_cache_and_manifest_provenance(
+    tmp_path, monkeypatch
+):
+    captured_kwargs: list[dict[str, object]] = []
+    created_agents: list[OllamaAgent] = []
+
+    class CapturingOllamaAgent(OllamaAgent):
+        def __init__(self, *args, **kwargs):
+            captured_kwargs.append(kwargs.copy())
+            super().__init__(
+                *args,
+                transport=httpx.MockTransport(_ollama_response),
+                **kwargs,
+            )
+            created_agents.append(self)
+
+    monkeypatch.setattr(profiles, "OllamaAgent", CapturingOllamaAgent)
+    cases = _cases(1)
+    cache = FileResponseCache(tmp_path / "cache")
+    options = _options(
+        tmp_path,
+        cases,
+        "primary-quality",
+        agent_backend="ollama",
+        primary_model="primary-model",
+        fallback_model="fallback-model",
+        ollama_endpoint="http://ollama.test",
+        preflight_result=_preflight_result(),
+        response_cache=cache,
+    )
+
+    manifest, _records, events = await run_profile(options)
+
+    assert manifest.agent_activity_timeout_s == 60.0
+    assert manifest.primary_model_digest == "sha256:primary"
+    assert manifest.fallback_model_digest == "sha256:fallback"
+    assert manifest.ollama_version == "0.6.2"
+    assert manifest.prompt_hashes is not None
+    assert set(manifest.prompt_hashes) == {"classify", "draft"}
+    assert manifest.schema_hashes is not None
+    assert set(manifest.schema_hashes) == {"classify", "draft"}
+    assert manifest.generation_settings is not None
+    assert manifest.generation_settings.stream is False
+    assert manifest.timeout_adjustment is not None
+    assert manifest.timeout_adjustment.http_timeout_s == 54.0
+    assert manifest.dependency_versions["httpx"]
+    assert len(captured_kwargs) == 1
+    assert captured_kwargs[0]["role"] == "primary"
+    assert captured_kwargs[0]["model"] == "primary-model"
+    assert captured_kwargs[0]["model_digest"] == "sha256:primary"
+    assert captured_kwargs[0]["ollama_version"] == "0.6.2"
+    assert captured_kwargs[0]["timeout_s"] == 54.0
+    assert captured_kwargs[0]["response_cache"] is cache
+    assert captured_kwargs[0]["identity_map"] is not None
+    assert captured_kwargs[0]["telemetry_sink"] is not None
+    assert len([event for event in events if event.cache_hit]) == 2
+    assert all(agent._client.is_closed for agent in created_agents)
+
+
+async def test_ollama_fallback_profile_uses_confirmed_fallback_provenance(
+    tmp_path, monkeypatch
+):
+    captured_kwargs: list[dict[str, object]] = []
+
+    class CapturingOllamaAgent(OllamaAgent):
+        def __init__(self, *args, **kwargs):
+            captured_kwargs.append(kwargs.copy())
+            super().__init__(
+                *args,
+                transport=httpx.MockTransport(_ollama_response),
+                **kwargs,
+            )
+
+    monkeypatch.setattr(profiles, "OllamaAgent", CapturingOllamaAgent)
+    cases = _cases(1)
+    options = _options(
+        tmp_path,
+        cases,
+        "fallback-quality",
+        fallback_agent_profile=TunableAgentProfile(role="fallback"),
+        agent_backend="ollama",
+        primary_model="primary-model",
+        fallback_model="fallback-model",
+        ollama_endpoint="http://ollama.test",
+        preflight_result=_preflight_result(),
+        cache_enabled=False,
+    )
+
+    manifest, records, _events = await run_profile(options)
+
+    assert manifest.agent_activity_timeout_s == 60.0
+    assert all(record.model_path == "fallback/fallback" for record in records)
+    assert len(captured_kwargs) == 1
+    assert captured_kwargs[0]["role"] == "fallback"
+    assert captured_kwargs[0]["model"] == "fallback-model"
+    assert captured_kwargs[0]["model_digest"] == "sha256:fallback"
