@@ -10,6 +10,7 @@ through the already-built `OllamaAgent`.
 """
 
 import statistics
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -18,6 +19,7 @@ import httpx
 
 from ticketflow.agent.ollama import OllamaAgent
 from ticketflow.eval.harness import WorkflowEvalConfig
+from ticketflow.eval.progress import ProgressCallback, emit
 from ticketflow.eval.telemetry import TelemetrySink
 from ticketflow.models import Ticket
 
@@ -282,6 +284,7 @@ async def run_preflight(
     probe_http_timeout_s: float,
     seed: int | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
+    progress: ProgressCallback | None = None,
 ) -> PreflightResult:
     """Run the full preflight sequence and return its result.
 
@@ -304,8 +307,16 @@ async def run_preflight(
     async with httpx.AsyncClient(
         base_url=endpoint, timeout=probe_http_timeout_s, transport=transport
     ) as admin_client:
+        emit(progress, "preflight", f"checking Ollama at {endpoint}")
         version = await check_ollama_version(admin_client)
+        emit(progress, "preflight", f"Ollama {version}; confirming models")
         models = await confirm_required_models(admin_client, required_models)
+        emit(
+            progress,
+            "preflight",
+            "models confirmed: "
+            + ", ".join(f"{model.role}={model.name}" for model in models),
+        )
 
     primary_name = required_models["primary"]
     primary_digest = next(model.digest for model in models if model.role == "primary")
@@ -324,14 +335,24 @@ async def run_preflight(
         ollama_version=version,
         transport=transport,
     ) as agent:
+        emit(progress, "preflight", f"warming up {primary_name} (unmeasured)")
         await agent.classify(_WARMUP_TICKET)
         sink.drain(_WARMUP_TICKET.id)
 
-        for ticket in probe_tickets:
+        for index, ticket in enumerate(probe_tickets, start=1):
+            started_at = time.perf_counter()
             classification = await agent.classify(ticket)
             draft = await agent.draft_reply(ticket, classification)
             confidences.append(draft.confidence)
             measurements.extend(_stage_measurements_from_sink(sink, ticket.id))
+            emit(
+                progress,
+                "preflight",
+                "probe classify+draft",
+                completed=index,
+                total=len(probe_tickets),
+                elapsed_s=time.perf_counter() - started_at,
+            )
 
     stage_seconds = _stage_seconds_for_timeout(measurements)
 

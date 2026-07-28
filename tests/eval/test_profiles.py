@@ -36,6 +36,7 @@ from ticketflow.eval.profiles import (
     run_profile,
     validate_repeats_cache,
 )
+from ticketflow.eval.progress import ProgressEvent
 from ticketflow.eval.records import RunManifest
 from ticketflow.models import ActionType, TicketCategory
 
@@ -679,3 +680,44 @@ async def test_ollama_fallback_profile_uses_confirmed_fallback_provenance(
     assert captured_kwargs[0]["role"] == "fallback"
     assert captured_kwargs[0]["model"] == "fallback-model"
     assert captured_kwargs[0]["model_digest"] == "sha256:fallback"
+
+
+# -- Progress reporting ---------------------------------------------------------------
+
+
+async def test_progress_callback_reports_every_case_across_policies(tmp_path):
+    cases = _cases(3)
+    events: list[ProgressEvent] = []
+    options = _options(
+        tmp_path, cases, "primary-quality", progress=events.append, concurrency=2
+    )
+
+    _manifest, records, _events = await run_profile(options)
+
+    case_events = [event for event in events if event.phase == "case"]
+    assert len(case_events) == len(records) == 6
+    # The counter spans both reviewer policies rather than restarting per policy, and
+    # every case reports the same total.
+    assert [event.completed for event in case_events] == [1, 2, 3, 4, 5, 6]
+    assert all(event.total == 6 for event in case_events)
+    assert {event.policy for event in case_events} == {"oracle", "rubber_stamp"}
+    assert {event.case_key for event in case_events} == {case.id for case in cases}
+    assert all(event.message == "resolved" for event in case_events)
+    assert all(event.elapsed_s is not None for event in case_events)
+
+    run_events = [event for event in events if event.phase == "run"]
+    assert run_events[0].total == 6
+    assert [event.policy for event in run_events[1:]] == ["oracle", "rubber_stamp"]
+
+
+async def test_run_profile_emits_nothing_when_no_progress_callback_is_installed(
+    tmp_path, capsys
+):
+    options = _options(tmp_path, _cases(2), "primary-quality")
+
+    await run_profile(options)
+
+    assert options.progress is None
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""

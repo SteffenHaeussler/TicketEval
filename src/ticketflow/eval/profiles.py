@@ -41,6 +41,7 @@ from ticketflow.eval.harness import (
     time_skipping_environment,
 )
 from ticketflow.eval.preflight import PreflightResult
+from ticketflow.eval.progress import ProgressCallback, emit
 from ticketflow.eval.records import (
     CallEvent,
     CaseRecord,
@@ -227,6 +228,9 @@ class RunOptions:
     schedule_to_start_s: float | None = None
     db_path: str | None = None
     poll_interval_s: float = 0.01
+    # None keeps run_profile() silent, which is what every library caller and test
+    # expects; the CLI installs a callback to render per-case lines.
+    progress: ProgressCallback | None = None
     environment_factory: Callable[
         [], AbstractAsyncContextManager[WorkflowEnvironment]
     ] = time_skipping_environment
@@ -458,6 +462,18 @@ def _build_workers_for_profile(
     )
 
 
+@dataclass
+class _ProgressState:
+    """Completion counter shared across every policy and repeat of one run.
+
+    Mutable by design: a run's progress line counts cases finished out of the whole
+    run, not out of the current policy, so the count has to survive across the
+    per-policy calls to `_run_policy`.
+    """
+
+    completed: int = 0
+
+
 async def _run_policy(
     runner: CaseRunner,
     cases: list[EvalCase],
@@ -466,15 +482,34 @@ async def _run_policy(
     reviewer: Reviewer,
     repeat_index: int,
     concurrency: int,
+    progress: ProgressCallback | None = None,
+    progress_total: int | None = None,
+    progress_state: _ProgressState | None = None,
 ) -> tuple[list[CaseRecord], list[CallEvent]]:
     """Run every case for one (repeat, policy) pair with bounded concurrency."""
     semaphore = asyncio.Semaphore(concurrency)
+    state = _ProgressState() if progress_state is None else progress_state
 
     async def _run_one(case: EvalCase) -> tuple[CaseRecord, list[CallEvent]]:
         async with semaphore:
-            return await runner.run_case(
+            result = await runner.run_case(
                 case, policy=policy, reviewer=reviewer, repeat_index=repeat_index
             )
+        # Cases finish out of submission order once concurrency > 1, so this counts
+        # completions rather than naming a position in `cases`.
+        state.completed += 1
+        record, _ = result
+        emit(
+            progress,
+            "case",
+            record.terminal_outcome,
+            completed=state.completed,
+            total=progress_total,
+            case_key=case.id,
+            policy=policy,
+            elapsed_s=record.end_to_end_latency_ms / 1000,
+        )
+        return result
 
     results = await asyncio.gather(*(_run_one(case) for case in cases))
     records = [record for record, _ in results]
@@ -519,6 +554,16 @@ async def run_profile(
     telemetry_sink = TelemetrySink()
     all_records: list[CaseRecord] = []
     all_events: list[CallEvent] = []
+    progress_state = _ProgressState()
+    progress_total = len(options.cases) * len(reviewer_policies) * options.repeats
+    emit(
+        options.progress,
+        "run",
+        f"profile {options.profile} on {options.agent_backend}: "
+        f"{len(options.cases)} cases x {len(reviewer_policies)} policies "
+        f"x {options.repeats} repeat(s)",
+        total=progress_total,
+    )
 
     async with options.environment_factory() as env:
         runner = CaseRunner(
@@ -562,6 +607,13 @@ async def run_profile(
                         await stack.enter_async_context(agent)
                     async with workers:
                         for policy in reviewer_policies:
+                            emit(
+                                options.progress,
+                                "run",
+                                f"repeat {repeat_index} policy {policy}: "
+                                f"{len(options.cases)} cases",
+                                policy=policy,
+                            )
                             records, events = await _run_policy(
                                 runner,
                                 options.cases,
@@ -569,6 +621,9 @@ async def run_profile(
                                 reviewer=_REVIEWERS[policy],
                                 repeat_index=repeat_index,
                                 concurrency=options.concurrency,
+                                progress=options.progress,
+                                progress_total=progress_total,
+                                progress_state=progress_state,
                             )
                             all_records.extend(records)
                             all_events.extend(events)

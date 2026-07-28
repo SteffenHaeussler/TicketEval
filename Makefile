@@ -1,6 +1,7 @@
-.PHONY: install install-hooks lint format-check format typecheck check test test-eval test-eval-ollama eval eval-ollama eval-dataset-check coverage smoke test-docker test-docker-tracing server server-docker up down logs stack-reset jaeger search-attributes worker llm-worker api doctor ticket status approve reject batch reset
+.PHONY: install install-hooks lint format-check format typecheck check test test-eval test-eval-ollama eval eval-ollama eval-dataset-check eval-report coverage smoke test-docker test-docker-tracing server server-docker up down logs stack-reset jaeger search-attributes worker llm-worker api doctor ticket status approve reject batch reset
 
 N ?= 100
+RUN_ID ?=
 API_URL ?= http://localhost:8000
 JAEGER_URL ?= http://localhost:16686
 TEMPORAL_NAMESPACE ?= default
@@ -54,6 +55,11 @@ eval-ollama:
 
 eval-dataset-check:
 	uv run python scripts/eval.py dataset-check
+
+# Reads an existing run's artifacts; needs neither Temporal nor Ollama.
+eval-report:
+	@test -n "$(RUN_ID)" || { echo "usage: make eval-report RUN_ID=run-..."; exit 2; }
+	uv run python scripts/eval.py report --run-id $(RUN_ID)
 
 coverage:
 	uv run pytest --cov=ticketflow --cov-report=term-missing

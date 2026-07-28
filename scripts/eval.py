@@ -34,13 +34,18 @@ from ticketflow.eval.profiles import (
     RunOptions,
     run_profile,
 )
+from ticketflow.eval.progress import ProgressEvent
 from ticketflow.eval.records import (
     RecordsError,
+    read_call_events,
+    read_case_records,
+    read_run_manifest,
     write_call_events,
     write_case_records,
     write_json_artifact,
     write_run_manifest,
 )
+from ticketflow.eval.report import render_markdown
 from ticketflow.models import Ticket
 
 DEFAULT_DATASET_DIR = Path("evals/data/tickets")
@@ -64,6 +69,8 @@ CASE_DEADLINE_TIMEOUT_MULTIPLE = 2.5
 # sooner -- they just each burn the others' wall clock against their own deadline.
 # Revisit if the server is configured with OLLAMA_NUM_PARALLEL > 1.
 OLLAMA_CONCURRENCY = 1
+# Matches render_markdown's own default; named here so --resamples can show it in help.
+DEFAULT_REPORT_RESAMPLES = 5000
 _REVIEWER_SELECTIONS: dict[str, tuple[ReviewerPolicy, ...]] = {
     "oracle": ("oracle",),
     "rubber_stamp": ("rubber_stamp",),
@@ -212,6 +219,28 @@ def _limited_cases(cases: list[EvalCase], limit: int) -> list[EvalCase]:
     return [case for case in cases if case.id in picked]
 
 
+def _print_progress(event: ProgressEvent) -> None:
+    """Render one progress event as a single stdout line.
+
+    Formatting lives here rather than in the harness so the eval library stays free
+    of I/O; the event carries counts as data and this decides how they read.
+    """
+    parts = [f"{event.phase}:"]
+    if event.completed is not None:
+        total = "?" if event.total is None else str(event.total)
+        parts.append(f"[{event.completed}/{total}]")
+    if event.case_key is not None:
+        parts.append(event.case_key)
+    if event.policy is not None and event.case_key is not None:
+        parts.append(f"policy={event.policy}")
+    parts.append(event.message)
+    if event.elapsed_s is not None:
+        parts.append(f"{event.elapsed_s:.1f}s")
+    # Real-model runs go minutes between lines, so unbuffered output matters more
+    # than the cost of a flush per case.
+    print(" ".join(parts), flush=True)
+
+
 async def _run_ollama_preflight(
     probe_cases: list[EvalCase], args: argparse.Namespace
 ) -> PreflightResult:
@@ -239,6 +268,7 @@ async def _run_ollama_preflight(
         workflow_eval_config=current_workflow_eval_config(),
         probe_http_timeout_s=config.OLLAMA_TIMEOUT_S,
         seed=args.seed,
+        progress=_print_progress,
     )
 
 
@@ -314,6 +344,7 @@ def run(args: argparse.Namespace) -> int:
                 if args.agent == "ollama"
                 else time_skipping_environment
             ),
+            progress=_print_progress,
         )
         manifest, records, events = asyncio.run(run_profile(options))
     except ProfileConfigError as exc:
@@ -358,6 +389,51 @@ def run(args: argparse.Namespace) -> int:
         )
         for violation in invariants.violations:
             print(f"  {violation.invariant} [{violation.case_key}]: {violation.detail}")
+    return 0
+
+
+def report(args: argparse.Namespace) -> int:
+    """Render the deterministic metrics report for one already-persisted run.
+
+    Reads only; the run directory is never written to, so raw artifacts and their
+    hashes survive any number of reports. Needs neither Temporal nor Ollama.
+    """
+    run_dir = args.runs_dir / args.run_id
+    if not run_dir.is_dir():
+        print(f"report failed: {run_dir}: no such run", file=sys.stderr)
+        return 1
+
+    try:
+        manifest = read_run_manifest(run_dir / "manifest.json")
+        records = read_case_records(run_dir / "records.jsonl")
+        events = read_call_events(run_dir / "calls.jsonl")
+    except (RecordsError, OSError) as exc:
+        print(f"report failed: {exc}", file=sys.stderr)
+        return 1
+
+    if not records:
+        print(f"report failed: {run_dir}: run has no case records", file=sys.stderr)
+        return 1
+
+    # The manifest's own seed keeps a report reproducible from the run it describes,
+    # rather than from whatever the caller happened to pass.
+    text = render_markdown(
+        records,
+        events,
+        bootstrap_seed=manifest.bootstrap_seed,
+        n_resamples=args.resamples,
+    )
+
+    if args.out is None:
+        print(text)
+        return 0
+    try:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(text + "\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"report failed: could not write report: {exc}", file=sys.stderr)
+        return 1
+    print(f"report: {args.out}")
     return 0
 
 
@@ -434,6 +510,27 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run_parser.set_defaults(handler=run)
+
+    report_parser = subparsers.add_parser("report")
+    report_parser.add_argument(
+        "--run-id",
+        required=True,
+        help=f"run id of a directory under {RUNS_DIR}",
+    )
+    report_parser.add_argument("--runs-dir", type=Path, default=RUNS_DIR)
+    report_parser.add_argument(
+        "--resamples",
+        type=int,
+        default=DEFAULT_REPORT_RESAMPLES,
+        help=f"bootstrap resamples per interval (default: {DEFAULT_REPORT_RESAMPLES})",
+    )
+    report_parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="write the report here instead of stdout; never inside the run directory",
+    )
+    report_parser.set_defaults(handler=report)
     return parser
 
 

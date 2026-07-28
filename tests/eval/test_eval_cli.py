@@ -25,6 +25,7 @@ from ticketflow.eval.records import (
     read_json_artifact,
     read_run_manifest,
 )
+from ticketflow.eval.report import render_markdown
 from ticketflow.models import ActionType, TicketCategory
 
 
@@ -784,3 +785,197 @@ def test_run_refuses_an_existing_run_directory_without_replacing_raw_artifacts(
     assert records_path.read_text() == "original raw record\n"
     assert "refusing to overwrite existing run" in capsys.readouterr().err
     assert list(artifacts_root.iterdir()) == [run_dir]
+
+
+# -- report ---------------------------------------------------------------------------
+
+
+def write_run_dir(root, run_id, *, bootstrap_seed=0, records=None):
+    """Persist a minimal but valid run directory and return (path, records, events)."""
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    run_dir = root / run_id
+    run_dir.mkdir(parents=True)
+    manifest = RunManifest(
+        run_id=run_id,
+        git_commit="abc123",
+        git_dirty=False,
+        dataset_path="evals/data/tickets",
+        dataset_sha256="hash",
+        agent_backend="tunable",
+        run_profile="primary-quality",
+        primary_model="tunable-primary",
+        python_version="3.12.0",
+        reviewer_policies=["oracle"],
+        cache_enabled=True,
+        confidence_threshold=0.75,
+        agent_task_queue="agent",
+        fallback_task_queue="fallback",
+        agent_schedule_to_start_s=30.0,
+        agent_activity_timeout_s=60.0,
+        agent_heartbeat_timeout_s=30.0,
+        seed=0,
+        bootstrap_seed=bootstrap_seed,
+        generation_seed_rule="test-rule/v1",
+        concurrency=8,
+        repeats=1,
+        started_at=now,
+        finished_at=now,
+    )
+    if records is None:
+        case = EvalCase.model_validate(
+            make_case(
+                "report-1",
+                difficulty="easy",
+                source="handwritten",
+                reference_category="billing",
+            )
+        )
+        records = [
+            CaseRecord(
+                run_id=run_id,
+                policy="oracle",
+                case_key="report-1",
+                repeat_index=0,
+                ticket_id="ticket-1",
+                difficulty="easy",
+                source="handwritten",
+                expected=case.expected,
+                predicted_category=TicketCategory.BILLING,
+                predicted_action=ActionType.REPLY_ONLY,
+                classification_confidence=0.9,
+                draft_confidence=0.9,
+                reply_text="Resolved.",
+                prediction_available=True,
+                terminal_outcome="resolved",
+                end_to_end_latency_ms=1.0,
+            )
+        ]
+    events = [
+        CallEvent(
+            run_id=run_id,
+            case_key="report-1",
+            ticket_id="ticket-1",
+            policy="oracle",
+            repeat_index=0,
+            operation="classify",
+            role="primary",
+            attempt=1,
+            cache_hit=False,
+            started_at=now,
+            wall_latency_ms=1.0,
+            model_total_duration_ms=None,
+            model_load_duration_ms=None,
+            outcome="success",
+            error_type=None,
+        )
+    ]
+    eval_cli.write_run_manifest(run_dir / "manifest.json", manifest)
+    eval_cli.write_case_records(run_dir / "records.jsonl", records)
+    eval_cli.write_call_events(run_dir / "calls.jsonl", events)
+    return run_dir, records, events
+
+
+def test_report_renders_the_same_markdown_as_a_direct_render(tmp_path, capsys):
+    runs_dir = tmp_path / "runs"
+    _run_dir, records, events = write_run_dir(runs_dir, "run-report", bootstrap_seed=7)
+
+    exit_code = eval_cli.main(
+        [
+            "report",
+            "--run-id",
+            "run-report",
+            "--runs-dir",
+            str(runs_dir),
+            "--resamples",
+            "50",
+        ]
+    )
+
+    assert exit_code == 0
+    # The manifest's own seed is what makes a report reproducible from its run, so a
+    # direct render has to be given that seed rather than the CLI default.
+    expected = render_markdown(records, events, bootstrap_seed=7, n_resamples=50)
+    assert capsys.readouterr().out == expected + "\n"
+
+
+def test_report_out_writes_the_file_and_leaves_raw_artifacts_untouched(
+    tmp_path, capsys
+):
+    runs_dir = tmp_path / "runs"
+    run_dir, _records, _events = write_run_dir(runs_dir, "run-report")
+    before = {path.name: path.read_bytes() for path in sorted(run_dir.iterdir())}
+    destination = tmp_path / "out" / "report.md"
+
+    exit_code = eval_cli.main(
+        [
+            "report",
+            "--run-id",
+            "run-report",
+            "--runs-dir",
+            str(runs_dir),
+            "--resamples",
+            "50",
+            "--out",
+            str(destination),
+        ]
+    )
+
+    assert exit_code == 0
+    assert destination.read_text(encoding="utf-8").startswith(
+        "# Deterministic Metrics Report"
+    )
+    assert capsys.readouterr().out == f"report: {destination}\n"
+    after = {path.name: path.read_bytes() for path in sorted(run_dir.iterdir())}
+    assert after == before
+
+
+def test_report_missing_run_directory_returns_error_without_reading_artifacts(
+    tmp_path, capsys
+):
+    runs_dir = tmp_path / "runs"
+    runs_dir.mkdir()
+
+    exit_code = eval_cli.main(
+        ["report", "--run-id", "run-absent", "--runs-dir", str(runs_dir)]
+    )
+
+    assert exit_code == 1
+    assert "no such run" in capsys.readouterr().err
+
+
+def test_report_malformed_artifact_returns_error_rather_than_raising(tmp_path, capsys):
+    runs_dir = tmp_path / "runs"
+    run_dir, _records, _events = write_run_dir(runs_dir, "run-report")
+    (run_dir / "records.jsonl").write_text("{not json\n")
+
+    exit_code = eval_cli.main(
+        ["report", "--run-id", "run-report", "--runs-dir", str(runs_dir)]
+    )
+
+    assert exit_code == 1
+    assert "report failed:" in capsys.readouterr().err
+
+
+def test_report_run_with_no_records_returns_error(tmp_path, capsys):
+    runs_dir = tmp_path / "runs"
+    run_dir, _records, _events = write_run_dir(runs_dir, "run-report")
+    (run_dir / "records.jsonl").write_text("")
+
+    exit_code = eval_cli.main(
+        ["report", "--run-id", "run-report", "--runs-dir", str(runs_dir)]
+    )
+
+    assert exit_code == 1
+    assert "no case records" in capsys.readouterr().err
+
+
+def test_report_defaults_to_the_committed_runs_directory(tmp_path, monkeypatch):
+    runs_dir = tmp_path / "runs"
+    write_run_dir(runs_dir, "run-report")
+    monkeypatch.setattr(eval_cli, "RUNS_DIR", runs_dir)
+
+    args = eval_cli.build_parser().parse_args(["report", "--run-id", "run-report"])
+
+    assert args.runs_dir == eval_cli.RUNS_DIR
+    assert args.resamples == eval_cli.DEFAULT_REPORT_RESAMPLES
+    assert args.handler is eval_cli.report
