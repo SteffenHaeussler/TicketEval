@@ -3,8 +3,19 @@
 import sqlite3
 from pathlib import Path
 
+from pydantic import BaseModel, ConfigDict
+
 from ticketflow import config
 from ticketflow.models import TicketResult
+
+
+class RefundObservation(BaseModel):
+    """Executed-refund and refund-attempt counts for one ticket."""
+
+    model_config = ConfigDict(frozen=True)
+
+    executed_count: int
+    attempt_count: int
 
 
 def _resolve(db_path: str | None) -> str:
@@ -78,6 +89,29 @@ def load_result(ticket_id: str, db_path: str | None = None) -> TicketResult | No
     finally:
         conn.close()
     return TicketResult.model_validate_json(row[0]) if row else None
+
+
+def get_refund_observation(
+    ticket_id: str, db_path: str | None = None
+) -> RefundObservation:
+    """Return the public refund execution and attempt counts for a ticket."""
+    path = _resolve(db_path)
+    if not Path(path).exists():
+        return RefundObservation(executed_count=0, attempt_count=0)
+    conn = _connect(path)
+    try:
+        executed_count = conn.execute(
+            "SELECT COUNT(*) FROM refunds WHERE ticket_id = ?", (ticket_id,)
+        ).fetchone()[0]
+        attempt_count = conn.execute(
+            "SELECT COUNT(*) FROM refund_attempts WHERE ticket_id = ?", (ticket_id,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    return RefundObservation(
+        executed_count=executed_count,
+        attempt_count=attempt_count,
+    )
 
 
 def clear(db_path: str | None = None) -> int:

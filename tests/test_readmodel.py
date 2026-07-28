@@ -4,6 +4,7 @@ import sqlite3
 
 from ticketflow import config, readmodel
 from ticketflow.models import TicketResult, TicketStatus
+from ticketflow.readmodel import RefundObservation
 
 
 def make_result(ticket_id: str = "t-1", **overrides: object) -> TicketResult:
@@ -82,6 +83,31 @@ def test_record_refund_logs_every_attempt_but_refunds_once(tmp_path):
         conn.close()
     assert attempts == [(1,), (2,)]
     assert refunds == 1
+
+
+def test_get_refund_observation_reports_executed_and_attempt_counts(tmp_path):
+    db = str(tmp_path / "read.db")
+    readmodel.record_refund("t-1", 42.0, attempt=1, db_path=db)
+    readmodel.record_refund("t-1", 42.0, attempt=2, db_path=db)
+
+    assert readmodel.get_refund_observation("t-1", db) == RefundObservation(
+        executed_count=1, attempt_count=2
+    )
+
+
+def test_get_refund_observation_returns_zeroes_without_database(tmp_path):
+    assert readmodel.get_refund_observation(
+        "t-1", str(tmp_path / "missing.db")
+    ) == RefundObservation(executed_count=0, attempt_count=0)
+
+
+def test_get_refund_observation_returns_zeroes_for_unobserved_ticket(tmp_path):
+    db = str(tmp_path / "read.db")
+    readmodel.record_refund("other", 42.0, attempt=1, db_path=db)
+
+    assert readmodel.get_refund_observation("t-1", db) == RefundObservation(
+        executed_count=0, attempt_count=0
+    )
 
 
 def test_record_refund_different_tickets_both_execute(tmp_path):
