@@ -49,6 +49,21 @@ RUNS_DIR = Path("evals/runs")
 DIFFICULTIES = ("easy", "ambiguous", "adversarial")
 SOURCES = ("handwritten", "generated")
 REFERENCE_CATEGORIES = ("billing", "technical", "account", "general")
+# Pacing defaults for the tunable agent, whose calls are near-instant.
+TUNABLE_CASE_DEADLINE_S = 60.0
+TUNABLE_CONCURRENCY = 8
+# One case is two sequential agent activities -- classify then draft -- plus workflow
+# and reviewer overhead, so the per-case deadline has to clear twice the activity
+# timeout that preflight sized from measured latency. The old fixed 60s deadline sat
+# below the 120s activity timeout, which made that timeout unreachable: the runner's
+# own asyncio.wait_for would always fire first. That was latent rather than live --
+# a fast local model still finished well inside 60s -- but it left the widening
+# preflight computes unable to take effect on slower hardware or larger models.
+CASE_DEADLINE_TIMEOUT_MULTIPLE = 2.5
+# A single Ollama server serialises generation, so concurrent cases do not finish any
+# sooner -- they just each burn the others' wall clock against their own deadline.
+# Revisit if the server is configured with OLLAMA_NUM_PARALLEL > 1.
+OLLAMA_CONCURRENCY = 1
 _REVIEWER_SELECTIONS: dict[str, tuple[ReviewerPolicy, ...]] = {
     "oracle": ("oracle",),
     "rubber_stamp": ("rubber_stamp",),
@@ -97,6 +112,44 @@ def dataset_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def _validate_pacing(
+    schedule_to_start: float | None, case_deadline_s: float
+) -> str | None:
+    """Return an error if the fallback reroute cannot fit inside the case deadline."""
+    if schedule_to_start is not None and schedule_to_start >= case_deadline_s:
+        return (
+            f"--schedule-to-start={schedule_to_start} must be below the per-case "
+            f"deadline of {case_deadline_s}s; every case would otherwise hit its "
+            "deadline before the fallback activity is dispatched"
+        )
+    return None
+
+
+def _resolve_pacing(
+    args: argparse.Namespace, preflight_result: PreflightResult | None
+) -> tuple[float, int]:
+    """Return the per-case deadline and concurrency to run with.
+
+    An explicitly passed flag always wins. Otherwise the tunable agent keeps its fast
+    defaults, and a real-model run derives its deadline from the activity timeout
+    preflight just measured so that widening can actually take effect.
+    """
+    case_deadline_s = args.case_deadline
+    concurrency = args.concurrency
+    if preflight_result is not None:
+        if case_deadline_s is None:
+            case_deadline_s = CASE_DEADLINE_TIMEOUT_MULTIPLE * (
+                preflight_result.timeout_adjustment.effective_activity_timeout_s
+            )
+        if concurrency is None:
+            concurrency = OLLAMA_CONCURRENCY
+    if case_deadline_s is None:
+        case_deadline_s = TUNABLE_CASE_DEADLINE_S
+    if concurrency is None:
+        concurrency = TUNABLE_CONCURRENCY
+    return case_deadline_s, concurrency
+
+
 def _validate_run_args(args: argparse.Namespace) -> str | None:
     """Return a user-facing validation error before any workflow is started."""
     if args.agent == "mock":
@@ -108,25 +161,21 @@ def _validate_run_args(args: argparse.Namespace) -> str | None:
         return "--limit must be >= 1"
     if args.repeats < 1:
         return "--repeats must be >= 1"
-    if args.concurrency < 1:
+    if args.concurrency is not None and args.concurrency < 1:
         return "--concurrency must be >= 1"
     if args.repeats > 1 and not args.no_cache:
         return f"--repeats={args.repeats} requires --no-cache"
     if args.profile == "reliability" and not args.no_cache:
         return "--profile reliability requires --no-cache"
-    if args.case_deadline <= 0:
+    if args.case_deadline is not None and args.case_deadline <= 0:
         return "--case-deadline must be > 0"
     if args.schedule_to_start is not None and args.schedule_to_start <= 0:
         return "--schedule-to-start must be > 0"
-    if (
-        args.schedule_to_start is not None
-        and args.schedule_to_start >= args.case_deadline
-    ):
-        return (
-            f"--schedule-to-start={args.schedule_to_start} must be below "
-            f"--case-deadline={args.case_deadline}; every case would otherwise "
-            "hit its deadline before the fallback activity is dispatched"
-        )
+    # A derived deadline is only knowable after preflight; run() re-checks it there.
+    if args.case_deadline is not None:
+        pacing_error = _validate_pacing(args.schedule_to_start, args.case_deadline)
+        if pacing_error is not None:
+            return pacing_error
 
     allowed = _PROFILE_REVIEWERS[args.profile]
     if args.reviewer is not None:
@@ -226,6 +275,13 @@ def run(args: argparse.Namespace) -> int:
         if not args.no_cache:
             response_cache = FileResponseCache(DEFAULT_CACHE_DIR)
 
+    case_deadline_s, concurrency = _resolve_pacing(args, preflight_result)
+    pacing_error = _validate_pacing(args.schedule_to_start, case_deadline_s)
+    if pacing_error is not None:
+        print(f"run failed: {pacing_error}", file=sys.stderr)
+        return 1
+    print(f"pacing: case deadline {case_deadline_s:.1f}s, concurrency {concurrency}")
+
     try:
         options = RunOptions(
             profile=args.profile,
@@ -245,10 +301,10 @@ def run(args: argparse.Namespace) -> int:
             response_cache=response_cache,
             seed=args.seed,
             bootstrap_seed=args.bootstrap_seed,
-            concurrency=args.concurrency,
+            concurrency=concurrency,
             repeats=args.repeats,
             cache_enabled=not args.no_cache,
-            case_deadline=timedelta(seconds=args.case_deadline),
+            case_deadline=timedelta(seconds=case_deadline_s),
             reviewer_policies=(
                 None if args.reviewer is None else _REVIEWER_SELECTIONS[args.reviewer]
             ),
@@ -343,7 +399,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="cap the case count, sampled across difficulties rather than head-sliced",
     )
     run_parser.add_argument("--repeats", type=int, default=1)
-    run_parser.add_argument("--concurrency", type=int, default=8)
+    run_parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=None,
+        help=(
+            f"cases in flight (default: {TUNABLE_CONCURRENCY} for --agent tunable, "
+            f"{OLLAMA_CONCURRENCY} for --agent ollama)"
+        ),
+    )
     run_parser.add_argument("--seed", type=int, default=0)
     run_parser.add_argument("--bootstrap-seed", type=int, default=0)
     run_parser.add_argument("--no-cache", action="store_true")
@@ -351,8 +415,13 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--case-deadline",
         type=float,
-        default=60.0,
-        help="per-case wall-clock deadline in seconds (default: 60)",
+        default=None,
+        help=(
+            "per-case wall-clock deadline in seconds (default: "
+            f"{TUNABLE_CASE_DEADLINE_S:.0f} for --agent tunable; for --agent ollama, "
+            f"{CASE_DEADLINE_TIMEOUT_MULTIPLE}x the activity timeout preflight "
+            "measured)"
+        ),
     )
     run_parser.add_argument(
         "--schedule-to-start",

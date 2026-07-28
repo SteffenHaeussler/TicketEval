@@ -11,7 +11,6 @@ from typing import Literal, Protocol
 from ticketflow.agent.base import Agent
 from ticketflow.agent.mock import MockAgent
 from ticketflow.agent.ollama import OllamaAgent
-from ticketflow.eval.cache import ResponseCache
 from ticketflow.eval.telemetry import TelemetrySink
 
 
@@ -35,13 +34,14 @@ def build_agent(
     role: Literal["primary", "fallback"],
     settings: AgentSettings,
     *,
-    cache: ResponseCache | None = None,
     event_sink: TelemetrySink | None = None,
 ) -> Agent:
     """Construct one role's agent from configuration.
 
-    Production calls pass no cache or event sink; the eval harness injects its own file
-    cache and telemetry sink explicitly when it needs them.
+    This seam deliberately takes no response cache. A cached `OllamaAgent` also needs
+    the runtime identity map, model digest, and Ollama version that only preflight can
+    supply, so the eval harness constructs its own cached agents in
+    `ticketflow.eval.profiles`; production runs uncached.
     """
     if settings.AGENT_BACKEND == "mock":
         if role == "primary":
@@ -58,7 +58,6 @@ def build_agent(
             timeout_s=settings.OLLAMA_TIMEOUT_S,
             seed=settings.OLLAMA_SEED,
             role=role,
-            response_cache=cache,
             telemetry_sink=event_sink,
         )
 

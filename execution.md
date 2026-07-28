@@ -1,6 +1,6 @@
 # Ticketflow Eval Harness — Execution Breakdown
 
-**Status:** milestone 1 code complete; human dataset verification pending · **Date:** 2026-07-27 · **Companion to:** [`plan.md`](./plan.md)
+**Status:** milestone 3 code complete; human dataset verification pending · **Date:** 2026-07-28 · **Companion to:** [`plan.md`](./plan.md)
 
 ## Purpose
 
@@ -564,7 +564,7 @@ output masquerade as a quality signal.
 |---|---|---|---|
 | M3-T1 | Periodic activity heartbeats *(production change)* | — | `src/ticketflow/activities.py`, `tests/test_activities.py`, `docs/context.md` |
 | M3-T2 | Prompts and schemas | M1-T1 | `src/ticketflow/agent/prompts.py`, `tests/eval/test_prompts.py` |
-| M3-T3 | Ollama agent | T2, T4, M2-T6 | `src/ticketflow/agent/ollama.py`, `tests/eval/test_ollama_agent.py` |
+| M3-T3 | Ollama agent | T2, T4, M2-T6 | `src/ticketflow/agent/ollama.py`, `tests/test_ollama_agent.py` |
 | M3-T4 | Response cache | T2 | `src/ticketflow/eval/cache.py`, `tests/eval/test_cache.py` |
 | M3-T5 | Preflight | T3 | `src/ticketflow/eval/preflight.py`, `tests/eval/test_preflight.py` |
 | M3-T6 | Manifest enrichment | T3, T5 | `src/ticketflow/eval/records.py`, `src/ticketflow/eval/profiles.py` |
@@ -632,7 +632,9 @@ outcome `invalid_output` is a first-class `CallEvent` outcome, and only an exhau
 - The second reviewer policy is 100% cache hits and receives byte-identical outputs for the same
   case and repeat despite different runtime ticket IDs.
 - Failed and invalid-output calls never invoke `put_success`.
-- No stub test performs real network I/O, and the suite is collected by default.
+- No stub test performs real network I/O, and the suite is collected by default. This is
+  why the tests live at `tests/test_ollama_agent.py` rather than under `tests/eval/`,
+  which `tests/eval/conftest.py` auto-marks `eval` and the default `addopts` deselects.
 
 ### M3-T4 — Response cache
 
