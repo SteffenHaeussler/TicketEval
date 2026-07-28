@@ -125,6 +125,43 @@ def make_manifest(**overrides):
     return RunManifest.model_validate(base)
 
 
+def make_ollama_manifest(**overrides):
+    base = dict(
+        agent_backend="ollama",
+        primary_model="primary:latest",
+        fallback_model="fallback:latest",
+        primary_model_digest="sha256:primary",
+        fallback_model_digest="sha256:fallback",
+        ollama_version="0.6.2",
+        dependency_versions={"httpx": "0.28.1", "pydantic": "2.10.6"},
+        prompt_hashes={"classify": "classify-prompt", "draft": "draft-prompt"},
+        schema_hashes={"classify": "classify-schema", "draft": "draft-schema"},
+        generation_settings=GenerationSettings(
+            stream=False,
+            think=False,
+            temperature=0.0,
+        ),
+        preflight_measurements=(
+            PreflightMeasurement(
+                operation="classify",
+                ticket_id="probe-1",
+                wall_latency_s=1.2,
+                load_duration_s=0.4,
+                generation_duration_s=0.7,
+            ),
+        ),
+        timeout_adjustment=TimeoutAdjustment(
+            configured_activity_timeout_s=60.0,
+            slowest_observed_stage_s=2.3,
+            effective_activity_timeout_s=60.0,
+            safety_margin_s=6.0,
+            http_timeout_s=54.0,
+        ),
+    )
+    base.update(overrides)
+    return make_manifest(**base)
+
+
 # --- overwrite refusal ---
 
 
@@ -336,6 +373,37 @@ def test_run_manifest_requires_both_operation_hashes_when_provenance_is_present(
         make_manifest(schema_hashes={"draft": "draft-schema"})
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("fallback_model", None),
+        ("primary_model_digest", None),
+        ("fallback_model_digest", None),
+        ("ollama_version", None),
+        ("prompt_hashes", None),
+        ("prompt_hashes", {"classify": "", "draft": "draft-prompt"}),
+        ("schema_hashes", None),
+        ("schema_hashes", {"classify": "classify-schema", "draft": ""}),
+        ("generation_settings", None),
+        ("preflight_measurements", ()),
+        ("timeout_adjustment", None),
+    ],
+)
+def test_ollama_run_manifest_requires_complete_reproducibility_provenance(
+    field, value
+):
+    with pytest.raises(ValidationError, match=field):
+        make_ollama_manifest(**{field: value})
+
+
+@pytest.mark.parametrize("backend", ["tunable", "mock"])
+def test_non_ollama_run_manifest_keeps_ollama_provenance_optional(backend):
+    manifest = make_manifest(agent_backend=backend)
+
+    assert manifest.primary_model_digest is None
+    assert manifest.preflight_measurements is None
+
+
 def test_case_record_round_trip_preserves_expected_outcome_label_collection(tmp_path):
     path = tmp_path / "records.jsonl"
     expected = make_expected(
@@ -542,6 +610,72 @@ def test_manifest_provenance_submodels_are_frozen_and_schema_constrained():
             load_duration_s=None,
             generation_duration_s=None,
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("wall_latency_s", -0.1),
+        ("wall_latency_s", float("inf")),
+        ("load_duration_s", -0.1),
+        ("load_duration_s", float("nan")),
+        ("generation_duration_s", -0.1),
+        ("generation_duration_s", float("inf")),
+    ],
+)
+def test_preflight_measurement_rejects_negative_or_non_finite_durations(field, value):
+    values = dict(
+        operation="classify",
+        ticket_id="probe-1",
+        wall_latency_s=1.2,
+        load_duration_s=None,
+        generation_duration_s=None,
+    )
+    values[field] = value
+    with pytest.raises(ValidationError, match=field):
+        PreflightMeasurement(**values)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("configured_activity_timeout_s", -0.1),
+        ("slowest_observed_stage_s", float("nan")),
+        ("effective_activity_timeout_s", 0.0),
+        ("safety_margin_s", -0.1),
+        ("http_timeout_s", float("inf")),
+    ],
+)
+def test_timeout_adjustment_rejects_invalid_timeout_values(field, value):
+    values = dict(
+        configured_activity_timeout_s=60.0,
+        slowest_observed_stage_s=2.3,
+        effective_activity_timeout_s=60.0,
+        safety_margin_s=6.0,
+        http_timeout_s=54.0,
+    )
+    values[field] = value
+    with pytest.raises(ValidationError, match=field):
+        TimeoutAdjustment(**values)
+
+
+def test_timeout_adjustment_requires_http_timeout_to_exclude_safety_margin():
+    with pytest.raises(ValidationError, match="http_timeout_s"):
+        TimeoutAdjustment(
+            configured_activity_timeout_s=60.0,
+            slowest_observed_stage_s=2.3,
+            effective_activity_timeout_s=60.0,
+            safety_margin_s=6.0,
+            http_timeout_s=55.0,
+        )
+
+
+@pytest.mark.parametrize("temperature", [-0.01, 2.01, float("nan"), float("inf")])
+def test_generation_settings_rejects_out_of_range_or_non_finite_temperature(
+    temperature,
+):
+    with pytest.raises(ValidationError, match="temperature"):
+        GenerationSettings(stream=False, think=False, temperature=temperature)
 
 
 # --- RunManifest completeness ---

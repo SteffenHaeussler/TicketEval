@@ -1,6 +1,7 @@
 """Immutable eval run-artifact models and atomic JSONL/JSON read/write helpers."""
 
 import json
+import math
 import os
 import tempfile
 from collections.abc import Sequence
@@ -166,9 +167,11 @@ class PreflightMeasurement(BaseModel):
 
     operation: Literal["classify", "draft"]
     ticket_id: str
-    wall_latency_s: float
-    load_duration_s: float | None
-    generation_duration_s: float | None
+    wall_latency_s: float = Field(ge=0.0, allow_inf_nan=False)
+    load_duration_s: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    generation_duration_s: float | None = Field(
+        default=None, ge=0.0, allow_inf_nan=False
+    )
 
 
 class TimeoutAdjustment(BaseModel):
@@ -176,11 +179,29 @@ class TimeoutAdjustment(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    configured_activity_timeout_s: float
-    slowest_observed_stage_s: float
-    effective_activity_timeout_s: float
-    safety_margin_s: float
-    http_timeout_s: float
+    configured_activity_timeout_s: float = Field(ge=0.0, allow_inf_nan=False)
+    slowest_observed_stage_s: float = Field(ge=0.0, allow_inf_nan=False)
+    effective_activity_timeout_s: float = Field(gt=0.0, allow_inf_nan=False)
+    safety_margin_s: float = Field(ge=0.0, allow_inf_nan=False)
+    http_timeout_s: float = Field(gt=0.0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _http_timeout_excludes_safety_margin(self) -> "TimeoutAdjustment":
+        """Keep the HTTP timeout derivation reproducible and internally coherent."""
+        expected_http_timeout_s = (
+            self.effective_activity_timeout_s - self.safety_margin_s
+        )
+        if not math.isclose(
+            self.http_timeout_s,
+            expected_http_timeout_s,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(
+                "http_timeout_s must equal effective_activity_timeout_s minus "
+                "safety_margin_s"
+            )
+        return self
 
 
 class GenerationSettings(BaseModel):
@@ -190,7 +211,7 @@ class GenerationSettings(BaseModel):
 
     stream: bool
     think: bool
-    temperature: float
+    temperature: float = Field(ge=0.0, le=2.0, allow_inf_nan=False)
 
 
 class RunManifest(BaseModel):
@@ -257,6 +278,38 @@ class RunManifest(BaseModel):
                 raise ValueError(
                     f"{field_name} must contain exactly classify and draft entries"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _ollama_runs_have_complete_reproducibility_provenance(self) -> "RunManifest":
+        """Require preflight-backed provenance only for real Ollama executions."""
+        if self.agent_backend != "ollama":
+            return self
+
+        for field_name in (
+            "fallback_model",
+            "primary_model_digest",
+            "fallback_model_digest",
+            "ollama_version",
+            "prompt_hashes",
+            "schema_hashes",
+            "generation_settings",
+            "timeout_adjustment",
+        ):
+            if not getattr(self, field_name):
+                raise ValueError(f"ollama manifest requires {field_name}")
+
+        for field_name, hashes in (
+            ("prompt_hashes", self.prompt_hashes),
+            ("schema_hashes", self.schema_hashes),
+        ):
+            if hashes is None or not all(hashes.values()):
+                raise ValueError(f"ollama manifest requires complete {field_name}")
+
+        if not self.preflight_measurements:
+            raise ValueError(
+                "ollama manifest requires non-empty preflight_measurements"
+            )
         return self
 
 
