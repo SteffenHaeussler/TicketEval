@@ -159,6 +159,40 @@ class CaseRecord(BaseModel):
         return self
 
 
+class PreflightMeasurement(BaseModel):
+    """One ordered Ollama preflight stage measurement persisted in a manifest."""
+
+    model_config = ConfigDict(frozen=True)
+
+    operation: Literal["classify", "draft"]
+    ticket_id: str
+    wall_latency_s: float
+    load_duration_s: float | None
+    generation_duration_s: float | None
+
+
+class TimeoutAdjustment(BaseModel):
+    """The complete timeout derivation produced by Ollama preflight."""
+
+    model_config = ConfigDict(frozen=True)
+
+    configured_activity_timeout_s: float
+    slowest_observed_stage_s: float
+    effective_activity_timeout_s: float
+    safety_margin_s: float
+    http_timeout_s: float
+
+
+class GenerationSettings(BaseModel):
+    """Deterministic Ollama generation controls recorded for reproducibility."""
+
+    model_config = ConfigDict(frozen=True)
+
+    stream: bool
+    think: bool
+    temperature: float
+
+
 class RunManifest(BaseModel):
     """Frozen run config/provenance snapshot, per plan.md's manifest bullets.
 
@@ -201,17 +235,29 @@ class RunManifest(BaseModel):
     started_at: datetime
     finished_at: datetime
 
-    # Deferred to M3-T6: not knowable without a real model run or preflight measurement.
+    # Ollama-only provenance remains unset for tunable and mock runs.
     primary_model_digest: str | None = None
     fallback_model_digest: str | None = None
     ollama_version: str | None = None
-    prompt_hash: str | None = None
-    schema_hash: str | None = None
-    generation_options: dict[str, float | int | bool | str] | None = None
-    preflight_measurements: dict[str, float] | None = None
-    effective_activity_timeout_s: float | None = None
-    safety_margin_s: float | None = None
-    http_timeout_s: float | None = None
+    prompt_hashes: dict[Literal["classify", "draft"], str] | None = None
+    schema_hashes: dict[Literal["classify", "draft"], str] | None = None
+    generation_settings: GenerationSettings | None = None
+    preflight_measurements: tuple[PreflightMeasurement, ...] | None = None
+    timeout_adjustment: TimeoutAdjustment | None = None
+
+    @model_validator(mode="after")
+    def _operation_hashes_cover_all_operations(self) -> "RunManifest":
+        """Require complete prompt/schema provenance whenever either is recorded."""
+        required_operations = {"classify", "draft"}
+        for field_name, hashes in (
+            ("prompt_hashes", self.prompt_hashes),
+            ("schema_hashes", self.schema_hashes),
+        ):
+            if hashes is not None and set(hashes) != required_operations:
+                raise ValueError(
+                    f"{field_name} must contain exactly classify and draft entries"
+                )
+        return self
 
 
 def _atomic_write_bytes(path: str | Path, data: bytes) -> None:
