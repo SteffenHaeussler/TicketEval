@@ -1,6 +1,9 @@
 """Activities wrap the agent and side effects."""
 
 import asyncio
+import contextlib
+from collections.abc import Awaitable
+from typing import TypeVar
 
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
@@ -9,21 +12,59 @@ from ticketflow import readmodel
 from ticketflow.agent.base import Agent, AgentPermanentError
 from ticketflow.models import Classification, DraftReply, Ticket, TicketResult
 
+_T = TypeVar("_T")
+
+DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 10.0
+
+
+async def _call_with_heartbeat(
+    call: Awaitable[_T], *, interval_seconds: float, detail: str
+) -> _T:
+    """Await `call` while heartbeating `detail` every `interval_seconds`.
+
+    A slow agent call can exceed the activity's heartbeat timeout, so a
+    background loop heartbeats for the duration of the call. The loop is
+    always cancelled and awaited before this function returns or raises.
+    """
+
+    async def _loop() -> None:
+        while True:
+            await asyncio.sleep(interval_seconds)
+            activity.heartbeat(detail)
+
+    heartbeat_task = asyncio.create_task(_loop())
+    try:
+        return await call
+    finally:
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
+
 
 class TicketActivities:
     """Temporal activities for agent calls and external side effects."""
 
-    def __init__(self, agent: Agent, db_path: str | None = None):
+    def __init__(
+        self,
+        agent: Agent,
+        db_path: str | None = None,
+        heartbeat_interval_seconds: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+    ):
         """Create activities backed by an agent and optional read-model path."""
         self._agent = agent
         self._db_path = db_path
+        self._heartbeat_interval_seconds = heartbeat_interval_seconds
 
     @activity.defn
     async def classify_ticket(self, ticket: Ticket) -> Classification:
         """Classify a ticket through the configured agent."""
         activity.heartbeat("classifying ticket")
         try:
-            result = await self._agent.classify(ticket)
+            result = await _call_with_heartbeat(
+                self._agent.classify(ticket),
+                interval_seconds=self._heartbeat_interval_seconds,
+                detail="classifying ticket",
+            )
         except AgentPermanentError as exc:
             raise ApplicationError(
                 str(exc), type="AgentPermanentError", non_retryable=True
@@ -38,7 +79,11 @@ class TicketActivities:
         """Ask the configured agent to draft a response."""
         activity.heartbeat("drafting reply")
         try:
-            result = await self._agent.draft_reply(ticket, classification)
+            result = await _call_with_heartbeat(
+                self._agent.draft_reply(ticket, classification),
+                interval_seconds=self._heartbeat_interval_seconds,
+                detail="drafting reply",
+            )
         except AgentPermanentError as exc:
             raise ApplicationError(
                 str(exc), type="AgentPermanentError", non_retryable=True

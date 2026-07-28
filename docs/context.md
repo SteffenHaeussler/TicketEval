@@ -182,26 +182,26 @@ DDIA-flavored narrative), `docs/agent-activity-ops.md` (LLM worker operations).
 - **Where:** `tests/test_smoke_stack.py`, `pyproject.toml`
   (`[tool.pytest.ini_options]`), `Makefile` (`up`/`down`/`smoke`/`test-docker`).
 
+## Periodic activity heartbeats during agent calls
+
+- **Decision:** `classify_ticket`/`draft_reply` heartbeat every
+  `heartbeat_interval_seconds` (production default 10s) from a background
+  task for the full duration of the agent call, not just immediately before
+  and after it (M3-T1).
+- **Why:** With `heartbeat_timeout=30s`, a real LLM call slower than 30s
+  would have been killed mid-flight; the before/after-only heartbeats only
+  worked because the mock agent's latency capped at 3s.
+- **Where:** `src/ticketflow/activities.py` (`_call_with_heartbeat`,
+  `TicketActivities.classify_ticket`, `TicketActivities.draft_reply`),
+  `tests/test_activities.py`.
+- **Taught:** A "heartbeat while awaiting" helper that always cancels and
+  awaits its background task in a `finally` keeps the liveness signal
+  correct on every exit path alike: success, a translated
+  `AgentPermanentError`, and a raw `AgentOverloadedError`.
+
 ---
 
 ## Open follow-ups
-
-### Periodic activity heartbeats
-
-**Why:** `classify_ticket`/`draft_reply` heartbeat only before and after the
-agent call (`src/ticketflow/activities.py:24-31`). With
-`heartbeat_timeout=30s`, a real LLM call taking longer than 30s would be killed
-mid-flight; the pattern only works because the mock's latency caps at 3s.
-
-**Steps:**
-- [ ] Wrap the agent call in a background heartbeat loop (e.g. an asyncio task
-      heartbeating every ~10s) and cancel it when the call returns.
-- [ ] Keep tests instant (latency defaults to 0).
-
-**Verify:**
-- [ ] `make test`.
-- [ ] Run with `MOCK_AGENT_LATENCY_MAX_S=45`: the activity survives its 30s
-      heartbeat timeout instead of failing.
 
 ### Fallback escape hatch
 
