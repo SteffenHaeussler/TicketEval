@@ -233,7 +233,6 @@ class RunOptions:
 
     def __post_init__(self) -> None:
         """Validate the option set before any I/O or workflow starts."""
-        validate_repeats_cache(self.repeats, self.cache_enabled)
         if self.repeats < 1:
             raise ProfileConfigError(f"repeats must be >= 1, got {self.repeats}")
         if self.concurrency < 1:
@@ -262,6 +261,14 @@ class RunOptions:
             )
         if self.agent_backend == "ollama":
             self._validate_ollama_preflight()
+        effective_cache_enabled = _effective_cache_enabled(
+            self.profile, self.cache_enabled
+        )
+        if self.agent_backend == "ollama":
+            effective_cache_enabled = (
+                effective_cache_enabled and self.response_cache is not None
+            )
+        validate_repeats_cache(self.repeats, effective_cache_enabled)
         # Raises for a selection the profile does not allow, before any I/O.
         resolve_reviewer_policies(self.profile, self.reviewer_policies)
 
@@ -278,18 +285,14 @@ class RunOptions:
             raise ProfileConfigError(
                 "ollama preflight primary model does not match primary_model"
             )
-        if self.fallback_model is not None:
-            fallback = models.get("fallback")
-            if fallback is None or fallback.name != self.fallback_model:
-                raise ProfileConfigError(
-                    "ollama preflight fallback model does not match fallback_model"
-                )
-        if (
-            self.profile in ("fallback-quality", "fallback-routing")
-            and self.fallback_model is None
-        ):
+        if self.fallback_model is None:
             raise ProfileConfigError(
-                f"profile {self.profile!r} requires fallback_model for ollama"
+                "ollama runs require fallback_model for complete manifest provenance"
+            )
+        fallback = models.get("fallback")
+        if fallback is None or fallback.name != self.fallback_model:
+            raise ProfileConfigError(
+                "ollama preflight fallback model does not match fallback_model"
             )
 
 

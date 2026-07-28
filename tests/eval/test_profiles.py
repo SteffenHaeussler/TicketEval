@@ -235,6 +235,38 @@ def test_run_options_rejects_ollama_preflight_for_a_different_primary_model():
         )
 
 
+def test_run_options_requires_fallback_provenance_for_every_ollama_run():
+    with pytest.raises(ProfileConfigError, match="fallback_model"):
+        RunOptions(
+            profile="primary-quality",
+            dataset_path="unused",
+            cases=[_case("case-1")],
+            primary_agent_profile=TunableAgentProfile(),
+            agent_backend="ollama",
+            primary_model="primary-model",
+            fallback_model=None,
+            ollama_endpoint="http://ollama.test",
+            preflight_result=_preflight_result(),
+        )
+
+
+def test_ollama_repeats_without_an_optional_cache_are_allowed():
+    options = RunOptions(
+        profile="primary-quality",
+        dataset_path="unused",
+        cases=[_case("case-1")],
+        primary_agent_profile=TunableAgentProfile(),
+        agent_backend="ollama",
+        primary_model="primary-model",
+        fallback_model="fallback-model",
+        ollama_endpoint="http://ollama.test",
+        preflight_result=_preflight_result(),
+        repeats=2,
+    )
+
+    assert options.response_cache is None
+
+
 def test_run_options_rejects_empty_cases():
     with pytest.raises(ProfileConfigError):
         RunOptions(
