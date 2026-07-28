@@ -515,9 +515,7 @@ def test_run_refuses_an_existing_run_directory_without_replacing_raw_artifacts(
     monkeypatch.setattr(eval_cli, "run_profile", run_profile)
 
     assert (
-        eval_cli.main(
-            ["run", "--profile", "primary-quality", "--allow-unverified"]
-        )
+        eval_cli.main(["run", "--profile", "primary-quality", "--allow-unverified"])
         == 1
     )
     assert records_path.read_text() == "original raw record\n"

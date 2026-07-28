@@ -389,9 +389,7 @@ def test_run_manifest_requires_both_operation_hashes_when_provenance_is_present(
         ("timeout_adjustment", None),
     ],
 )
-def test_ollama_run_manifest_requires_complete_reproducibility_provenance(
-    field, value
-):
+def test_ollama_run_manifest_requires_complete_reproducibility_provenance(field, value):
     with pytest.raises(ValidationError, match=field):
         make_ollama_manifest(**{field: value})
 

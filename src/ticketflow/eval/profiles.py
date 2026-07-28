@@ -248,8 +248,7 @@ class RunOptions:
             )
         if (
             self.agent_backend == "tunable"
-            and
-            self.profile in ("fallback-quality", "fallback-routing")
+            and self.profile in ("fallback-quality", "fallback-routing")
             and self.fallback_agent_profile is None
         ):
             raise ProfileConfigError(
@@ -612,39 +611,39 @@ async def run_profile(
         adjustment = options.preflight_result.timeout_adjustment
         manifest_data.update(
             {
-            "primary_model_digest": model_digests["primary"],
-            "fallback_model_digest": model_digests.get("fallback"),
-            "ollama_version": options.preflight_result.ollama_version,
-            "prompt_hashes": {
-                CLASSIFICATION_SPEC.operation: CLASSIFICATION_SPEC.prompt_hash,
-                DRAFT_SPEC.operation: DRAFT_SPEC.prompt_hash,
-            },
-            "schema_hashes": {
-                CLASSIFICATION_SPEC.operation: CLASSIFICATION_SPEC.schema_hash,
-                DRAFT_SPEC.operation: DRAFT_SPEC.schema_hash,
-            },
-            "generation_settings": GenerationSettings(
-                stream=False,
-                think=False,
-                temperature=0.0,
-            ),
-            "preflight_measurements": tuple(
-                PreflightMeasurement(
-                    operation=measurement.operation,
-                    ticket_id=measurement.ticket_id,
-                    wall_latency_s=measurement.wall_latency_s,
-                    load_duration_s=measurement.load_duration_s,
-                    generation_duration_s=measurement.generation_duration_s,
-                )
-                for measurement in options.preflight_result.measurements
-            ),
-            "timeout_adjustment": TimeoutAdjustment(
-                configured_activity_timeout_s=adjustment.configured_activity_timeout_s,
-                slowest_observed_stage_s=adjustment.slowest_observed_stage_s,
-                effective_activity_timeout_s=adjustment.effective_activity_timeout_s,
-                safety_margin_s=adjustment.safety_margin_s,
-                http_timeout_s=adjustment.http_timeout_s,
-            ),
+                "primary_model_digest": model_digests["primary"],
+                "fallback_model_digest": model_digests.get("fallback"),
+                "ollama_version": options.preflight_result.ollama_version,
+                "prompt_hashes": {
+                    CLASSIFICATION_SPEC.operation: CLASSIFICATION_SPEC.prompt_hash,
+                    DRAFT_SPEC.operation: DRAFT_SPEC.prompt_hash,
+                },
+                "schema_hashes": {
+                    CLASSIFICATION_SPEC.operation: CLASSIFICATION_SPEC.schema_hash,
+                    DRAFT_SPEC.operation: DRAFT_SPEC.schema_hash,
+                },
+                "generation_settings": GenerationSettings(
+                    stream=False,
+                    think=False,
+                    temperature=0.0,
+                ),
+                "preflight_measurements": tuple(
+                    PreflightMeasurement(
+                        operation=measurement.operation,
+                        ticket_id=measurement.ticket_id,
+                        wall_latency_s=measurement.wall_latency_s,
+                        load_duration_s=measurement.load_duration_s,
+                        generation_duration_s=measurement.generation_duration_s,
+                    )
+                    for measurement in options.preflight_result.measurements
+                ),
+                "timeout_adjustment": TimeoutAdjustment(
+                    configured_activity_timeout_s=adjustment.configured_activity_timeout_s,
+                    slowest_observed_stage_s=adjustment.slowest_observed_stage_s,
+                    effective_activity_timeout_s=adjustment.effective_activity_timeout_s,
+                    safety_margin_s=adjustment.safety_margin_s,
+                    http_timeout_s=adjustment.http_timeout_s,
+                ),
             }
         )
 
