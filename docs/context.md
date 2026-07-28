@@ -199,6 +199,33 @@ DDIA-flavored narrative), `docs/agent-activity-ops.md` (LLM worker operations).
   correct on every exit path alike: success, a translated
   `AgentPermanentError`, and a raw `AgentOverloadedError`.
 
+## Per-case pacing derived from preflight for real-model runs
+
+- **Decision:** `--case-deadline` and `--concurrency` default to unset. The
+  tunable agent keeps 60s/8; an `--agent ollama` run derives its deadline as
+  `2.5 x effective_activity_timeout_s` from the preflight measurement and drops
+  concurrency to 1. An explicitly passed flag always wins.
+- **Why:** The runner wraps each case in `asyncio.wait_for(case_deadline)`,
+  and `AGENT_ACTIVITY_TIMEOUT` is already 2 minutes, so the old fixed 60s
+  deadline sat *below* the activity timeout M3-T5 exists to widen — the outer
+  deadline would always fire first and the widening could never take effect.
+  A single Ollama server also serialises generation, so concurrent cases only
+  burn each other's wall clock.
+- **Measured:** This was latent, not live. On the development machine
+  `qwen3.6:35b` measured ~3s per stage, and a deliberate reproduction under the
+  old defaults (`--case-deadline 60 --concurrency 8 --no-cache`) resolved 12/12
+  cases with a 17.1s worst-case latency. The fix protects slower hardware,
+  larger models, and larger case sets; it did not repair a failing run.
+- **Where:** `scripts/eval.py` (`_resolve_pacing`, `_validate_pacing`,
+  `CASE_DEADLINE_TIMEOUT_MULTIPLE`), `tests/eval/test_eval_cli.py`,
+  `tests/eval/test_ollama_smoke.py` (asserts no case reaches
+  `runner_deadline_exceeded`), `Makefile` (`eval-ollama`).
+- **Taught:** An outer wall-clock deadline and an inner per-call timeout are
+  one coupled pair; sizing either alone leaves the other unreachable. And a
+  timeout inequality that looks fatal on paper still needs measuring before
+  it is called a bug — the reproduction cost two minutes and corrected the
+  severity.
+
 ---
 
 ## Open follow-ups

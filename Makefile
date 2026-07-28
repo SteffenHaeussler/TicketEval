@@ -47,8 +47,10 @@ test-eval-ollama:
 eval:
 	uv run python scripts/eval.py run --profile primary-quality --agent tunable --reviewer both --allow-unverified
 
+# Preflight already spends ~21 real generations before the first case is scored, so
+# keep the scored set small. Case deadline and concurrency are derived from preflight.
 eval-ollama:
-	uv run python scripts/eval.py run --profile primary-quality --agent ollama --reviewer both --allow-unverified --limit 10
+	uv run python scripts/eval.py run --profile primary-quality --agent ollama --reviewer both --allow-unverified --limit 6
 
 eval-dataset-check:
 	uv run python scripts/eval.py dataset-check

@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from scripts import eval as eval_cli
 from ticketflow.eval.cache import FileResponseCache
@@ -377,6 +377,80 @@ def test_run_ollama_runs_preflight_and_builds_options_with_real_provenance(
     assert options.preflight_result is not None
     assert isinstance(options.response_cache, FileResponseCache)
     assert options.environment_factory is local_environment
+    # Derived from the 60s activity timeout preflight measured, so the widening
+    # preflight performs is actually reachable inside the runner's own deadline.
+    assert options.case_deadline == timedelta(seconds=150.0)
+    assert options.concurrency == 1
+
+
+def test_run_ollama_pacing_flags_override_the_preflight_derived_defaults(monkeypatch):
+    observed = {}
+
+    async def run_preflight(**kwargs):
+        return make_preflight_result()
+
+    async def run_profile(options):
+        observed["options"] = options
+        raise ProfileConfigError("stop after options are built")
+
+    monkeypatch.setattr(eval_cli, "run_preflight", run_preflight)
+    monkeypatch.setattr(eval_cli, "run_profile", run_profile)
+
+    assert (
+        eval_cli.main(
+            [
+                "run",
+                "--profile",
+                "primary-quality",
+                "--agent",
+                "ollama",
+                "--primary-model",
+                "ollama-primary",
+                "--fallback-model",
+                "ollama-fallback",
+                "--allow-unverified",
+                "--limit",
+                "1",
+                "--case-deadline",
+                "900",
+                "--concurrency",
+                "4",
+            ]
+        )
+        == 1
+    )
+
+    assert observed["options"].case_deadline == timedelta(seconds=900.0)
+    assert observed["options"].concurrency == 4
+
+
+def test_run_tunable_keeps_its_fast_pacing_defaults(tmp_path, monkeypatch):
+    observed = {}
+
+    async def run_profile(options):
+        observed["options"] = options
+        raise ProfileConfigError("stop after options are built")
+
+    monkeypatch.setattr(eval_cli, "run_profile", run_profile)
+
+    assert (
+        eval_cli.main(
+            [
+                "run",
+                "--profile",
+                "primary-quality",
+                "--allow-unverified",
+                "--limit",
+                "1",
+            ]
+        )
+        == 1
+    )
+
+    assert observed["options"].case_deadline == timedelta(
+        seconds=eval_cli.TUNABLE_CASE_DEADLINE_S
+    )
+    assert observed["options"].concurrency == eval_cli.TUNABLE_CONCURRENCY
 
 
 def test_run_ollama_no_cache_skips_response_cache(monkeypatch):
@@ -476,7 +550,7 @@ def test_run_rejects_schedule_to_start_at_or_above_case_deadline(capsys):
         ]
     )
     assert result == 1
-    assert "must be below --case-deadline=60.0" in capsys.readouterr().err
+    assert "must be below the per-case deadline of 60.0s" in capsys.readouterr().err
 
 
 def test_limit_samples_across_difficulties_instead_of_head_slicing():
@@ -636,6 +710,8 @@ def test_run_writes_profile_artifacts_and_supports_authoring_dataset(
     assert (run_dir / "calls.jsonl").is_file()
     assert (run_dir / "invariants.json").is_file()
     assert capsys.readouterr().out == (
+        f"pacing: case deadline {eval_cli.TUNABLE_CASE_DEADLINE_S:.1f}s, "
+        f"concurrency {eval_cli.TUNABLE_CONCURRENCY}\n"
         f"run_id: run-cli-test\n"
         f"artifacts: {run_dir}\n"
         f"cases: 1 records, 1 call events\n"

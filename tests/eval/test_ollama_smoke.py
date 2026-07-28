@@ -107,6 +107,14 @@ def _assert_well_formed_artifacts(run_dir: Path, profile: str) -> set[str]:
     assert manifest.fallback_model_digest
     assert manifest.ollama_version
     assert len(records) == _SMOKE_CASE_LIMIT
+    # A case that blew the runner's wall-clock deadline still writes a well-formed
+    # record, so without this the whole smoke run can pass while nothing was scored.
+    timed_out = [
+        record.case_key
+        for record in records
+        if record.terminal_outcome == "runner_deadline_exceeded"
+    ]
+    assert not timed_out, f"{profile} cases hit the runner deadline: {timed_out}"
     assert {record.policy for record in records} == {"oracle"}
     assert {record.model_path for record in records} == {f"{role}/{role}"}
     assert len({record.case_key for record in records}) == _SMOKE_CASE_LIMIT
