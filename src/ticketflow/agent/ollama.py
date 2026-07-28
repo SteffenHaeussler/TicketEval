@@ -69,7 +69,9 @@ class OllamaAgent:
                 "response_cache requires identity_map, model_digest, and ollama_version"
             )
 
-        self._model = model or config.OLLAMA_MODEL
+        self._model = model or (
+            config.PRIMARY_MODEL if role == "primary" else config.FALLBACK_MODEL
+        )
         self._seed = config.OLLAMA_SEED if seed is None else seed
         self._role: Literal["primary", "fallback"] = role
         self._response_cache = response_cache

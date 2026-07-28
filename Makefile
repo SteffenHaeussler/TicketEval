@@ -48,7 +48,7 @@ eval:
 	uv run python scripts/eval.py run --profile primary-quality --agent tunable --reviewer both --allow-unverified
 
 eval-ollama:
-	uv run python scripts/eval_ollama.py
+	uv run python scripts/eval.py run --profile primary-quality --agent ollama --reviewer both --allow-unverified --limit 10
 
 eval-dataset-check:
 	uv run python scripts/eval.py dataset-check

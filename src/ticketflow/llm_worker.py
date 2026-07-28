@@ -9,16 +9,28 @@ from temporalio.worker import Worker
 
 from ticketflow import config
 from ticketflow.activities import TicketActivities
-from ticketflow.agent.mock import MockAgent
+from ticketflow.agent.factory import build_agent
 from ticketflow.logging import setup_logging
 from ticketflow.tracing import setup_tracing
 
 logger = logging.getLogger(__name__)
 
 
+def _build_activities() -> tuple[TicketActivities, TicketActivities]:
+    """Construct primary and fallback activities from `TICKETFLOW_AGENT_BACKEND`.
+
+    Runs before any Temporal client or worker is constructed, so an invalid backend
+    fails fast instead of leaving a half-started worker.
+    """
+    primary_agent = build_agent("primary", config)
+    fallback_agent = build_agent("fallback", config)
+    return TicketActivities(primary_agent), TicketActivities(fallback_agent)
+
+
 async def main() -> None:
     """Run primary and fallback LLM workers until interrupted."""
     setup_logging()
+    primary_activities, fallback_activities = _build_activities()
     interceptor = setup_tracing(service_name="ticketflow-llm-worker")
     client = await Client.connect(
         config.TEMPORAL_ADDRESS,
@@ -26,14 +38,6 @@ async def main() -> None:
         data_converter=pydantic_data_converter,
         interceptors=[interceptor] if interceptor else [],
     )
-
-    primary_activities = TicketActivities(
-        MockAgent(
-            latency_range=(0.0, config.MOCK_AGENT_LATENCY_MAX_S),
-            model="primary",
-        )
-    )
-    fallback_activities = TicketActivities(MockAgent.fallback())
 
     primary_worker = Worker(
         client,

@@ -2,8 +2,18 @@ import json
 from datetime import datetime, timezone
 
 from scripts import eval as eval_cli
+from ticketflow.eval.cache import FileResponseCache
 from ticketflow.eval.dataset import EvalCase
+from ticketflow.eval.harness import local_environment
 from ticketflow.eval.invariants import InvariantReport
+from ticketflow.eval.preflight import (
+    ConfidenceGateResult,
+    ModelInfo,
+    ModelMissingError,
+    PreflightResult,
+    StageMeasurement,
+)
+from ticketflow.eval.preflight import TimeoutAdjustment as PreflightTimeoutAdjustment
 from ticketflow.eval.profiles import ProfileConfigError
 from ticketflow.eval.records import (
     CallEvent,
@@ -16,6 +26,42 @@ from ticketflow.eval.records import (
     read_run_manifest,
 )
 from ticketflow.models import ActionType, TicketCategory
+
+
+def make_preflight_result(
+    *, primary_model: str = "ollama-primary", fallback_model: str = "ollama-fallback"
+) -> PreflightResult:
+    return PreflightResult(
+        ollama_version="0.6.2",
+        models=(
+            ModelInfo(role="primary", name=primary_model, digest="sha256:primary"),
+            ModelInfo(role="fallback", name=fallback_model, digest="sha256:fallback"),
+        ),
+        measurements=(
+            StageMeasurement(
+                operation="classify",
+                ticket_id="preflight-probe-1",
+                wall_latency_s=1.0,
+                load_duration_s=0.25,
+                generation_duration_s=0.75,
+            ),
+        ),
+        timeout_adjustment=PreflightTimeoutAdjustment(
+            configured_activity_timeout_s=30.0,
+            slowest_observed_stage_s=20.0,
+            effective_activity_timeout_s=60.0,
+            safety_margin_s=6.0,
+            http_timeout_s=54.0,
+        ),
+        confidence_gate=ConfidenceGateResult(
+            samples=(0.5, 0.6, 0.7, 0.8, 0.9),
+            std_dev=0.1,
+            distinct_count=5,
+            passes_std_dev_gate=True,
+            passes_distinctness_gate=True,
+        ),
+        workflow_eval_config=eval_cli.current_workflow_eval_config(),
+    )
 
 
 def make_case(case_id, *, difficulty, source, reference_category, verified=True):
@@ -274,6 +320,147 @@ def test_run_accepts_a_reviewer_narrowing_a_quality_profile(tmp_path, monkeypatc
         == 1
     )
     assert observed["options"].reviewer_policies == ("oracle",)
+
+
+def test_run_ollama_runs_preflight_and_builds_options_with_real_provenance(
+    tmp_path, monkeypatch
+):
+    preflight_calls = {}
+    observed = {}
+
+    async def run_preflight(**kwargs):
+        preflight_calls.update(kwargs)
+        return make_preflight_result()
+
+    async def run_profile(options):
+        observed["options"] = options
+        raise ProfileConfigError("stop after options are built")
+
+    monkeypatch.setattr(eval_cli, "run_preflight", run_preflight)
+    monkeypatch.setattr(eval_cli, "run_profile", run_profile)
+
+    assert (
+        eval_cli.main(
+            [
+                "run",
+                "--profile",
+                "primary-quality",
+                "--agent",
+                "ollama",
+                "--primary-model",
+                "ollama-primary",
+                "--fallback-model",
+                "ollama-fallback",
+                "--ollama-endpoint",
+                "http://ollama.example:11434",
+                "--allow-unverified",
+                "--limit",
+                "1",
+            ]
+        )
+        == 1
+    )
+
+    assert preflight_calls["endpoint"] == "http://ollama.example:11434"
+    assert preflight_calls["required_models"] == {
+        "primary": "ollama-primary",
+        "fallback": "ollama-fallback",
+    }
+    # Probing draws from the full dataset, not the --limit'd run cases.
+    assert len(preflight_calls["probe_tickets"]) > 1
+
+    options = observed["options"]
+    assert options.agent_backend == "ollama"
+    assert options.primary_model == "ollama-primary"
+    assert options.fallback_model == "ollama-fallback"
+    assert options.ollama_endpoint == "http://ollama.example:11434"
+    assert options.preflight_result is not None
+    assert isinstance(options.response_cache, FileResponseCache)
+    assert options.environment_factory is local_environment
+
+
+def test_run_ollama_no_cache_skips_response_cache(monkeypatch):
+    observed = {}
+
+    async def run_preflight(**kwargs):
+        return make_preflight_result()
+
+    async def run_profile(options):
+        observed["options"] = options
+        raise ProfileConfigError("stop after options are built")
+
+    monkeypatch.setattr(eval_cli, "run_preflight", run_preflight)
+    monkeypatch.setattr(eval_cli, "run_profile", run_profile)
+
+    assert (
+        eval_cli.main(
+            [
+                "run",
+                "--profile",
+                "reliability",
+                "--agent",
+                "ollama",
+                "--primary-model",
+                "ollama-primary",
+                "--fallback-model",
+                "ollama-fallback",
+                "--no-cache",
+                "--allow-unverified",
+                "--limit",
+                "1",
+            ]
+        )
+        == 1
+    )
+
+    assert observed["options"].response_cache is None
+
+
+def test_run_ollama_preflight_failure_stops_before_run_profile(monkeypatch, capsys):
+    started = False
+
+    async def run_preflight(**kwargs):
+        raise ModelMissingError("model 'ollama-primary' is not installed")
+
+    async def run_profile(_options):
+        nonlocal started
+        started = True
+        raise AssertionError("run_profile must not start")
+
+    monkeypatch.setattr(eval_cli, "run_preflight", run_preflight)
+    monkeypatch.setattr(eval_cli, "run_profile", run_profile)
+
+    result = eval_cli.main(
+        [
+            "run",
+            "--profile",
+            "primary-quality",
+            "--agent",
+            "ollama",
+            "--allow-unverified",
+        ]
+    )
+
+    assert result == 1
+    assert "ollama-primary" in capsys.readouterr().err
+    assert not started
+
+
+def test_run_rejects_mock_agent_before_any_io(monkeypatch, capsys):
+    started = False
+
+    async def run_profile(_options):
+        nonlocal started
+        started = True
+        raise AssertionError("run_profile must not start")
+
+    monkeypatch.setattr(eval_cli, "run_profile", run_profile)
+
+    result = eval_cli.main(["run", "--profile", "primary-quality", "--agent", "mock"])
+
+    assert result == 1
+    assert "--agent mock is not available" in capsys.readouterr().err
+    assert not started
 
 
 def test_run_rejects_schedule_to_start_at_or_above_case_deadline(capsys):

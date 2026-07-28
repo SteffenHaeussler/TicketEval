@@ -12,9 +12,22 @@ from itertools import zip_longest
 from pathlib import Path
 from typing import cast
 
+from ticketflow import config
 from ticketflow.agent.tunable import TunableAgentProfile
+from ticketflow.eval.cache import FileResponseCache
 from ticketflow.eval.dataset import DatasetError, EvalCase, load_cases, validate_dataset
+from ticketflow.eval.harness import (
+    current_workflow_eval_config,
+    local_environment,
+    time_skipping_environment,
+)
 from ticketflow.eval.invariants import check_all_invariants
+from ticketflow.eval.preflight import (
+    MIN_PROBE_CASES,
+    PreflightError,
+    PreflightResult,
+    run_preflight,
+)
 from ticketflow.eval.profiles import (
     ProfileConfigError,
     ReviewerPolicy,
@@ -28,8 +41,10 @@ from ticketflow.eval.records import (
     write_json_artifact,
     write_run_manifest,
 )
+from ticketflow.models import Ticket
 
 DEFAULT_DATASET_DIR = Path("evals/data/tickets")
+DEFAULT_CACHE_DIR = Path("evals/cache")
 RUNS_DIR = Path("evals/runs")
 DIFFICULTIES = ("easy", "ambiguous", "adversarial")
 SOURCES = ("handwritten", "generated")
@@ -84,10 +99,10 @@ def dataset_check(args: argparse.Namespace) -> int:
 
 def _validate_run_args(args: argparse.Namespace) -> str | None:
     """Return a user-facing validation error before any workflow is started."""
-    if args.agent != "tunable":
+    if args.agent == "mock":
         return (
-            f"--agent {args.agent!r} is not available yet; milestone 2 supports "
-            "only --agent tunable"
+            "--agent mock is not available in scripts/eval.py; supported eval "
+            "agents are 'tunable' and 'ollama'"
         )
     if args.limit is not None and args.limit < 1:
         return "--limit must be >= 1"
@@ -148,6 +163,36 @@ def _limited_cases(cases: list[EvalCase], limit: int) -> list[EvalCase]:
     return [case for case in cases if case.id in picked]
 
 
+async def _run_ollama_preflight(
+    probe_cases: list[EvalCase], args: argparse.Namespace
+) -> PreflightResult:
+    """Confirm Ollama is ready and size timeouts before any case is scored.
+
+    Probes from the full, unlimited dataset regardless of `--limit`, so a small ad hoc
+    run still gets a valid preflight sample.
+    """
+    probe_tickets = [
+        Ticket(
+            id=f"preflight-{case.id}",
+            customer_email=case.customer_email,
+            subject=case.subject,
+            body=case.body,
+        )
+        for case in probe_cases[:MIN_PROBE_CASES]
+    ]
+    return await run_preflight(
+        endpoint=args.ollama_endpoint,
+        required_models={
+            "primary": args.primary_model,
+            "fallback": args.fallback_model,
+        },
+        probe_tickets=probe_tickets,
+        workflow_eval_config=current_workflow_eval_config(),
+        probe_http_timeout_s=config.OLLAMA_TIMEOUT_S,
+        seed=args.seed,
+    )
+
+
 def run(args: argparse.Namespace) -> int:
     """Run one supported profile and persist its immutable raw artifacts."""
     validation_error = _validate_run_args(args)
@@ -156,18 +201,30 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        cases = load_cases(
+        all_cases = load_cases(
             DEFAULT_DATASET_DIR, require_verified=not args.allow_unverified
         )
     except DatasetError as exc:
         print(f"run failed: {exc}", file=sys.stderr)
         return 1
 
+    cases = all_cases
     if args.limit is not None:
         cases = _limited_cases(cases, args.limit)
     if not cases:
         print("run failed: no cases selected", file=sys.stderr)
         return 1
+
+    preflight_result: PreflightResult | None = None
+    response_cache = None
+    if args.agent == "ollama":
+        try:
+            preflight_result = asyncio.run(_run_ollama_preflight(all_cases, args))
+        except PreflightError as exc:
+            print(f"run failed: preflight failed: {exc}", file=sys.stderr)
+            return 1
+        if not args.no_cache:
+            response_cache = FileResponseCache(DEFAULT_CACHE_DIR)
 
     try:
         options = RunOptions(
@@ -177,6 +234,15 @@ def run(args: argparse.Namespace) -> int:
             primary_agent_profile=TunableAgentProfile(),
             fallback_agent_profile=TunableAgentProfile(role="fallback"),
             agent_backend=args.agent,
+            primary_model=(
+                args.primary_model if args.agent == "ollama" else "tunable-primary"
+            ),
+            fallback_model=(
+                args.fallback_model if args.agent == "ollama" else "tunable-fallback"
+            ),
+            ollama_endpoint=args.ollama_endpoint if args.agent == "ollama" else None,
+            preflight_result=preflight_result,
+            response_cache=response_cache,
             seed=args.seed,
             bootstrap_seed=args.bootstrap_seed,
             concurrency=args.concurrency,
@@ -187,6 +253,11 @@ def run(args: argparse.Namespace) -> int:
                 None if args.reviewer is None else _REVIEWER_SELECTIONS[args.reviewer]
             ),
             schedule_to_start_s=args.schedule_to_start,
+            environment_factory=(
+                local_environment
+                if args.agent == "ollama"
+                else time_skipping_environment
+            ),
         )
         manifest, records, events = asyncio.run(run_profile(options))
     except ProfileConfigError as exc:
@@ -257,6 +328,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--agent", choices=("tunable", "mock", "ollama"), default="tunable"
     )
+    run_parser.add_argument("--primary-model", default=config.PRIMARY_MODEL)
+    run_parser.add_argument("--fallback-model", default=config.FALLBACK_MODEL)
+    run_parser.add_argument("--ollama-endpoint", default=config.OLLAMA_ENDPOINT)
     run_parser.add_argument(
         "--reviewer",
         choices=("oracle", "rubber_stamp", "both"),
