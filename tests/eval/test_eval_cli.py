@@ -454,3 +454,70 @@ def test_run_writes_profile_artifacts_and_supports_authoring_dataset(
         f"cases: 1 records, 1 call events\n"
         f"invariants: ok (1 records checked)\n"
     )
+
+
+def test_run_refuses_an_existing_run_directory_without_replacing_raw_artifacts(
+    tmp_path, monkeypatch, capsys
+):
+    dataset = write_shard(
+        tmp_path,
+        "dataset.jsonl",
+        [
+            make_case(
+                "case-1",
+                difficulty="easy",
+                source="handwritten",
+                reference_category="billing",
+            )
+        ],
+    )
+    artifacts_root = tmp_path / "runs"
+    run_dir = artifacts_root / "run-existing"
+    run_dir.mkdir(parents=True)
+    records_path = run_dir / "records.jsonl"
+    records_path.write_text("original raw record\n")
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    async def run_profile(_options):
+        return (
+            RunManifest(
+                run_id="run-existing",
+                git_commit="abc123",
+                git_dirty=False,
+                dataset_path=str(dataset),
+                dataset_sha256="hash",
+                agent_backend="tunable",
+                run_profile="primary-quality",
+                primary_model="tunable-primary",
+                python_version="3.12.0",
+                reviewer_policies=["oracle"],
+                cache_enabled=True,
+                confidence_threshold=0.75,
+                agent_task_queue="agent",
+                fallback_task_queue="fallback",
+                agent_schedule_to_start_s=30.0,
+                agent_activity_timeout_s=60.0,
+                agent_heartbeat_timeout_s=30.0,
+                seed=0,
+                bootstrap_seed=0,
+                generation_seed_rule="test-rule/v1",
+                concurrency=1,
+                repeats=1,
+                started_at=now,
+                finished_at=now,
+            ),
+            [],
+            [],
+        )
+
+    monkeypatch.setattr(eval_cli, "DEFAULT_DATASET_DIR", dataset)
+    monkeypatch.setattr(eval_cli, "RUNS_DIR", artifacts_root)
+    monkeypatch.setattr(eval_cli, "run_profile", run_profile)
+
+    assert (
+        eval_cli.main(["run", "--profile", "primary-quality", "--allow-unverified"])
+        == 1
+    )
+    assert records_path.read_text() == "original raw record\n"
+    assert "refusing to overwrite existing run" in capsys.readouterr().err
+    assert list(artifacts_root.iterdir()) == [run_dir]
