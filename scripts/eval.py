@@ -5,18 +5,27 @@ import asyncio
 import shutil
 import sys
 import tempfile
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Callable
+from datetime import timedelta
+from itertools import zip_longest
 from pathlib import Path
 from typing import cast
 
 from ticketflow.agent.tunable import TunableAgentProfile
-from ticketflow.eval.dataset import DatasetError, load_cases, validate_dataset
-from ticketflow.eval.profiles import ProfileConfigError, RunOptions, run_profile
+from ticketflow.eval.dataset import DatasetError, EvalCase, load_cases, validate_dataset
+from ticketflow.eval.invariants import check_all_invariants
+from ticketflow.eval.profiles import (
+    ProfileConfigError,
+    ReviewerPolicy,
+    RunOptions,
+    run_profile,
+)
 from ticketflow.eval.records import (
     RecordsError,
     write_call_events,
     write_case_records,
+    write_json_artifact,
     write_run_manifest,
 )
 
@@ -25,11 +34,18 @@ RUNS_DIR = Path("evals/runs")
 DIFFICULTIES = ("easy", "ambiguous", "adversarial")
 SOURCES = ("handwritten", "generated")
 REFERENCE_CATEGORIES = ("billing", "technical", "account", "general")
-_PROFILE_REVIEWERS = {
-    "primary-quality": "both",
-    "fallback-quality": "both",
-    "fallback-routing": "oracle",
-    "reliability": "oracle",
+_REVIEWER_SELECTIONS: dict[str, tuple[ReviewerPolicy, ...]] = {
+    "oracle": ("oracle",),
+    "rubber_stamp": ("rubber_stamp",),
+    "both": ("oracle", "rubber_stamp"),
+}
+# What each profile allows; mirrors profiles._reviewer_policies_for. A selection must
+# be a subset, so --reviewer oracle is a legal narrowing of a quality profile.
+_PROFILE_REVIEWERS: dict[str, tuple[ReviewerPolicy, ...]] = {
+    "primary-quality": ("oracle", "rubber_stamp"),
+    "fallback-quality": ("oracle", "rubber_stamp"),
+    "fallback-routing": ("oracle",),
+    "reliability": ("oracle",),
 }
 
 
@@ -83,11 +99,53 @@ def _validate_run_args(args: argparse.Namespace) -> str | None:
         return f"--repeats={args.repeats} requires --no-cache"
     if args.profile == "reliability" and not args.no_cache:
         return "--profile reliability requires --no-cache"
+    if args.case_deadline <= 0:
+        return "--case-deadline must be > 0"
+    if args.schedule_to_start is not None and args.schedule_to_start <= 0:
+        return "--schedule-to-start must be > 0"
+    if (
+        args.schedule_to_start is not None
+        and args.schedule_to_start >= args.case_deadline
+    ):
+        return (
+            f"--schedule-to-start={args.schedule_to_start} must be below "
+            f"--case-deadline={args.case_deadline}; every case would otherwise "
+            "hit its deadline before the fallback activity is dispatched"
+        )
 
-    expected_reviewer = _PROFILE_REVIEWERS[args.profile]
-    if args.reviewer is not None and args.reviewer != expected_reviewer:
-        return f"{args.profile} requires --reviewer {expected_reviewer}"
+    allowed = _PROFILE_REVIEWERS[args.profile]
+    if args.reviewer is not None:
+        unsupported = [
+            policy
+            for policy in _REVIEWER_SELECTIONS[args.reviewer]
+            if policy not in allowed
+        ]
+        if unsupported:
+            return (
+                f"--profile {args.profile} does not support reviewer "
+                f"{unsupported[0]!r}; it allows {', '.join(allowed)}"
+            )
     return None
+
+
+def _limited_cases(cases: list[EvalCase], limit: int) -> list[EvalCase]:
+    """Take `limit` cases spread across difficulties, in dataset order.
+
+    Shards load alphabetically (adversarial, ambiguous, easy), so a plain head slice
+    would hand back only the hardest cases. Round-robin across difficulty first, then
+    restore dataset order so artifacts stay easy to diff.
+    """
+    by_difficulty: dict[str, list[EvalCase]] = defaultdict(list)
+    for case in cases:
+        by_difficulty[case.difficulty].append(case)
+
+    groups = [by_difficulty[key] for key in DIFFICULTIES if by_difficulty[key]]
+    picked: set[str] = set()
+    for row in zip_longest(*groups):
+        for case in row:
+            if case is not None and len(picked) < limit:
+                picked.add(case.id)
+    return [case for case in cases if case.id in picked]
 
 
 def run(args: argparse.Namespace) -> int:
@@ -106,7 +164,7 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     if args.limit is not None:
-        cases = cases[: args.limit]
+        cases = _limited_cases(cases, args.limit)
     if not cases:
         print("run failed: no cases selected", file=sys.stderr)
         return 1
@@ -124,11 +182,20 @@ def run(args: argparse.Namespace) -> int:
             concurrency=args.concurrency,
             repeats=args.repeats,
             cache_enabled=not args.no_cache,
+            case_deadline=timedelta(seconds=args.case_deadline),
+            reviewer_policies=(
+                None if args.reviewer is None else _REVIEWER_SELECTIONS[args.reviewer]
+            ),
+            schedule_to_start_s=args.schedule_to_start,
         )
         manifest, records, events = asyncio.run(run_profile(options))
     except ProfileConfigError as exc:
         print(f"run failed: {exc}", file=sys.stderr)
         return 1
+
+    invariants = check_all_invariants(
+        records, events, confidence_threshold=manifest.confidence_threshold
+    )
 
     run_dir = RUNS_DIR / manifest.run_id
     staging_dir: Path | None = None
@@ -140,6 +207,7 @@ def run(args: argparse.Namespace) -> int:
         write_run_manifest(staging_dir / "manifest.json", manifest)
         write_case_records(staging_dir / "records.jsonl", records)
         write_call_events(staging_dir / "calls.jsonl", events)
+        write_json_artifact(staging_dir / "invariants.json", invariants)
         if run_dir.exists():
             raise FileExistsError(f"{run_dir}: refusing to overwrite existing run")
         staging_dir.rename(run_dir)
@@ -151,6 +219,18 @@ def run(args: argparse.Namespace) -> int:
 
     print(f"run_id: {manifest.run_id}")
     print(f"artifacts: {run_dir}")
+    print(f"cases: {len(records)} records, {len(events)} call events")
+    # A violated invariant is a finding, not a run failure, so this never changes the
+    # exit status -- it only makes the finding impossible to miss.
+    if invariants.ok:
+        print(f"invariants: ok ({invariants.total_checked} records checked)")
+    else:
+        print(
+            f"invariants: {len(invariants.violations)} violation(s) across "
+            f"{invariants.total_checked} records"
+        )
+        for violation in invariants.violations:
+            print(f"  {violation.invariant} [{violation.case_key}]: {violation.detail}")
     return 0
 
 
@@ -178,15 +258,38 @@ def build_parser() -> argparse.ArgumentParser:
         "--agent", choices=("tunable", "mock", "ollama"), default="tunable"
     )
     run_parser.add_argument(
-        "--reviewer", choices=("oracle", "rubber_stamp", "both"), default=None
+        "--reviewer",
+        choices=("oracle", "rubber_stamp", "both"),
+        default=None,
+        help="reviewer policies to run; defaults to everything the profile allows",
     )
-    run_parser.add_argument("--limit", type=int)
+    run_parser.add_argument(
+        "--limit",
+        type=int,
+        help="cap the case count, sampled across difficulties rather than head-sliced",
+    )
     run_parser.add_argument("--repeats", type=int, default=1)
     run_parser.add_argument("--concurrency", type=int, default=8)
     run_parser.add_argument("--seed", type=int, default=0)
     run_parser.add_argument("--bootstrap-seed", type=int, default=0)
     run_parser.add_argument("--no-cache", action="store_true")
     run_parser.add_argument("--allow-unverified", action="store_true")
+    run_parser.add_argument(
+        "--case-deadline",
+        type=float,
+        default=60.0,
+        help="per-case wall-clock deadline in seconds (default: 60)",
+    )
+    run_parser.add_argument(
+        "--schedule-to-start",
+        type=float,
+        default=None,
+        help=(
+            "override the agent schedule-to-start timeout in seconds. "
+            "fallback-routing waits this out in real time, so set it well below "
+            "--case-deadline (default: ticketflow.workflows' own constant)"
+        ),
+    )
     run_parser.set_defaults(handler=run)
     return parser
 

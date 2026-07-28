@@ -14,6 +14,7 @@ from tests.helpers import (
     wait_for_status,
 )
 from ticketflow import workflows
+from ticketflow.activities import TicketActivities
 from ticketflow.eval.harness import (
     CombinedWorker,
     WorkflowEvalConfig,
@@ -44,6 +45,48 @@ def _distinct_config() -> WorkflowEvalConfig:
         agent_activity_timeout_s=current.agent_activity_timeout_s + 1,
         agent_heartbeat_timeout_s=current.agent_heartbeat_timeout_s + 1,
     )
+
+
+async def test_patched_activity_timeout_reaches_primary_and_fallback_options(
+    monkeypatch,
+):
+    """M2-T2: a preflight-adjusted timeout must reach *both* activity option sets.
+
+    Both option dicts are built from module globals at call time, so this captures
+    what each path actually hands to Temporal rather than trusting that.
+    """
+    captured: list[dict] = []
+
+    async def fake_execute_activity_method(_activity_method, *_args, **kwargs):
+        captured.append(kwargs)
+        return "ok"
+
+    monkeypatch.setattr(
+        workflows.workflow, "execute_activity_method", fake_execute_activity_method
+    )
+    config = _distinct_config().model_copy(
+        update={"agent_activity_timeout_s": 123.0, "agent_heartbeat_timeout_s": 45.0}
+    )
+
+    with patched_workflow_constants(config):
+        # Neither path touches `self`; both read the patched module constants.
+        await TicketWorkflow._execute_agent_activity(
+            cast(TicketWorkflow, None), TicketActivities.classify_ticket
+        )
+        await workflows._execute_fallback_agent_activity(
+            TicketActivities.classify_ticket
+        )
+
+    assert len(captured) == 2
+    primary, fallback = captured
+    assert primary["task_queue"] == config.agent_task_queue
+    assert fallback["task_queue"] == config.fallback_task_queue
+    assert primary["schedule_to_start_timeout"] == timedelta(
+        seconds=config.agent_schedule_to_start_s
+    )
+    for options in (primary, fallback):
+        assert options["start_to_close_timeout"] == timedelta(seconds=123.0)
+        assert options["heartbeat_timeout"] == timedelta(seconds=45.0)
 
 
 def test_current_workflow_eval_config_reads_module_defaults():

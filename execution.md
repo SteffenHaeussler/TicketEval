@@ -457,17 +457,24 @@ does not issue raw SQLite queries. Finish by emitting one `CaseRecord` plus its 
 Implement the four run profiles and the manifest they produce. `primary-quality` and
 `fallback-quality` both back the primary agent queue directly — the second with the fallback model —
 so they measure model quality and are paired by case ID. `fallback-routing` is a *different
-experiment*: it hosts a worker only on the fallback queue, withholds the primary worker, forces the
-real schedule-to-start timeout, runs under time skipping over a small subset, and its results are
-excluded from model-quality headlines. `reliability` runs with oracle only, cache disabled, and full
+experiment*: it hosts a worker only on the fallback queue, withholds the primary worker, exercises
+the real schedule-to-start mechanism over a small subset, and its results are excluded from
+model-quality headlines. `reliability` runs with oracle only, cache disabled, and full
 call telemetry. Assemble the manifest with the git commit and dirty state, dataset SHA-256, workflow
 constant snapshot, reviewer policies and their order, run seed, bootstrap seed, derived-generation
 seed rule, concurrency, and repeats.
 
+**Schedule-to-start is not time-skippable.** It is enforced by the matching service, not by a
+workflow timer the client can fast-forward, so the test server cannot skip it — `tests/test_workflow.py`
+already proves the same mechanism by configuring a small timeout. Runs therefore execute with auto
+time skipping *disabled* (it also races the server's global unlock counter under concurrency), and
+`fallback-routing` shortens `AGENT_SCHEDULE_TO_START_S` via `--schedule-to-start` instead.
+
 **Acceptance**
 
-- A fallback-routing run completes in wall-clock time far below `AGENT_SCHEDULE_TO_START_S` per
-  case, proving time skipping is actually in play.
+- A fallback-routing run completes in wall-clock time far below the default
+  `AGENT_SCHEDULE_TO_START_S` per case, by shortening the configured timeout; the manifest records
+  the shortened value that was actually in force.
 - Routing records identify the fallback path and are excluded from quality comparisons.
 - The manifest records dirty state truthfully on a dirty tree.
 - `--repeats > 1` is rejected with the cache enabled.
@@ -499,15 +506,23 @@ Extend `scripts/eval.py` with `run --profile primary-quality|fallback-quality|fa
 reliability` and the option set from `plan.md`: `--agent`, `--reviewer`, `--limit`, `--repeats`,
 `--concurrency`, `--seed`, `--no-cache`. Enforce that `--repeats > 1` implies `--no-cache` and a
 different derived generation seed per repeat. Add `--bootstrap-seed`, defaulting to `0`, and a
-`make eval` target for the fast tunable profile.
+`make eval` target for the fast tunable profile. Also add `--case-deadline` and
+`--schedule-to-start`, which `fallback-routing` needs to finish in reasonable wall-clock time.
+
+`--reviewer` selects which of the profile's policies to run; a selection must be a subset of what
+the profile allows, so `--reviewer oracle` legally narrows a quality profile but `--reviewer both`
+is still rejected for routing and reliability. `--limit` samples across difficulties rather than
+head-slicing, since shards load alphabetically and a head slice would return only adversarial cases.
 
 **Acceptance**
 
 - `make eval` completes a full tunable run over the committed dataset with no Temporal server or
-  Ollama installed beyond the test server.
+  Ollama installed beyond the test server, asserted end to end without stubbing `run_profile`.
 - Invalid option combinations fail before any workflow starts, with a message explaining why.
 - CLI option parsing and validation are covered in `tests/eval/test_eval_cli.py`.
 - Run artifacts land under `evals/runs/<run_id>/` and are gitignored.
+- The run writes `invariants.json` beside the raw artifacts and prints the violation count; a
+  violated invariant never changes the exit status.
 
 ### M2-T8 — Cross-cutting workflow suite
 

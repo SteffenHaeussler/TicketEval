@@ -193,6 +193,9 @@ class RunManifest(BaseModel):
 
     seed: int
     bootstrap_seed: int
+    # Identifies how per-repeat generation seeds were derived from `seed`, so a run
+    # stays reproducible if the rule ever changes. See profiles.GENERATION_SEED_RULE.
+    generation_seed_rule: str
     concurrency: int
     repeats: int
     started_at: datetime
@@ -291,7 +294,7 @@ def _read_json(path: str | Path, model_cls: type[T]) -> T:
     try:
         return model_cls.model_validate(raw)
     except ValidationError as exc:
-        raise RecordsReadError(f"{dest}: invalid manifest ({exc})") from exc
+        raise RecordsReadError(f"{dest}: invalid {model_cls.__name__} ({exc})") from exc
 
 
 def write_case_records(path: str | Path, records: list[CaseRecord]) -> None:
@@ -322,3 +325,18 @@ def write_run_manifest(path: str | Path, manifest: RunManifest) -> None:
 def read_run_manifest(path: str | Path) -> RunManifest:
     """Read a run manifest from its single-object JSON artifact."""
     return _read_json(path, RunManifest)
+
+
+def write_json_artifact(path: str | Path, model: BaseModel) -> None:
+    """Write any model as a single-object JSON artifact, refusing to overwrite.
+
+    Used for run artifacts whose model lives in a module that already imports this
+    one -- `InvariantReport`, for instance -- so no dedicated writer can be added
+    here without a circular import.
+    """
+    _write_json(path, model)
+
+
+def read_json_artifact(path: str | Path, model_cls: type[T]) -> T:
+    """Read any model back from a single-object JSON artifact."""
+    return _read_json(path, model_cls)

@@ -14,7 +14,7 @@ import importlib.metadata
 import platform
 import subprocess
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -47,6 +47,10 @@ RunProfile = Literal[
 
 _REVIEWERS: dict[str, Reviewer] = {"oracle": oracle, "rubber_stamp": rubber_stamp}
 _DEPENDENCY_NAMES = ("temporalio", "pydantic")
+
+# Recorded in every manifest so an old run stays reproducible if derive_generation_seed
+# ever changes. Bump the version suffix whenever that function's output changes.
+GENERATION_SEED_RULE = "sha256(run_seed \\x1f repeat_index)[:8] big-endian/v1"
 
 
 class ProfilesError(Exception):
@@ -137,13 +141,42 @@ def _dependency_versions() -> dict[str, str]:
     return versions
 
 
-def _reviewer_policies_for(
-    profile: RunProfile,
-) -> list[Literal["oracle", "rubber_stamp"]]:
-    """Return the reviewer policies a profile executes, in run order."""
+ReviewerPolicy = Literal["oracle", "rubber_stamp"]
+
+
+def _reviewer_policies_for(profile: RunProfile) -> list[ReviewerPolicy]:
+    """Return the reviewer policies a profile may execute, in run order.
+
+    Quality profiles pair both policies so reviewer effect can be separated from
+    model quality. Routing and reliability measure availability, not review, so
+    plan.md restricts them to the oracle.
+    """
     if profile in ("primary-quality", "fallback-quality"):
         return ["oracle", "rubber_stamp"]
     return ["oracle"]
+
+
+def resolve_reviewer_policies(
+    profile: RunProfile, requested: Sequence[ReviewerPolicy] | None
+) -> list[ReviewerPolicy]:
+    """Resolve an explicit reviewer selection against what the profile allows.
+
+    `None` means "run the profile's full set". An explicit selection must be a
+    non-empty subset of that set, and is returned in the profile's own order so the
+    reviewer sequence never depends on how the flags were typed.
+    """
+    allowed = _reviewer_policies_for(profile)
+    if requested is None:
+        return allowed
+    if not requested:
+        raise ProfileConfigError("reviewer_policies must not be empty")
+    unsupported = [policy for policy in requested if policy not in allowed]
+    if unsupported:
+        raise ProfileConfigError(
+            f"profile {profile!r} does not support reviewer policy "
+            f"{unsupported[0]!r}; it allows {', '.join(allowed)}"
+        )
+    return [policy for policy in allowed if policy in set(requested)]
 
 
 def _effective_cache_enabled(profile: RunProfile, cache_enabled: bool) -> bool:
@@ -172,6 +205,11 @@ class RunOptions:
     repeats: int = 1
     cache_enabled: bool = True
     case_deadline: timedelta = timedelta(seconds=60)
+    reviewer_policies: tuple[ReviewerPolicy, ...] | None = None
+    # None keeps ticketflow.workflows' own AGENT_SCHEDULE_TO_START_S. fallback-routing
+    # has to actually wait this out in wall-clock time (the test server does not skip
+    # schedule-to-start), so a routing run wants it well under case_deadline.
+    schedule_to_start_s: float | None = None
     db_path: str | None = None
     poll_interval_s: float = 0.01
     environment_factory: Callable[
@@ -201,6 +239,12 @@ class RunOptions:
             raise ProfileConfigError(
                 f"profile {self.profile!r} requires fallback_agent_profile"
             )
+        if self.schedule_to_start_s is not None and self.schedule_to_start_s <= 0:
+            raise ProfileConfigError(
+                f"schedule_to_start_s must be > 0, got {self.schedule_to_start_s}"
+            )
+        # Raises for a selection the profile does not allow, before any I/O.
+        resolve_reviewer_policies(self.profile, self.reviewer_policies)
 
 
 def _tunable_agent(
@@ -322,14 +366,17 @@ async def run_profile(
     git = git_info()
     dataset_hash = dataset_sha256(options.dataset_path)
 
-    config = current_workflow_eval_config().model_copy(
-        update={
-            "agent_task_queue": f"eval-{options.run_id}-agent",
-            "fallback_task_queue": f"eval-{options.run_id}-fallback",
-        }
-    )
+    config_update: dict[str, object] = {
+        "agent_task_queue": f"eval-{options.run_id}-agent",
+        "fallback_task_queue": f"eval-{options.run_id}-fallback",
+    }
+    if options.schedule_to_start_s is not None:
+        config_update["agent_schedule_to_start_s"] = options.schedule_to_start_s
+    config = current_workflow_eval_config().model_copy(update=config_update)
     workflow_queue = f"eval-{options.run_id}-workflow"
-    reviewer_policies = _reviewer_policies_for(options.profile)
+    reviewer_policies = resolve_reviewer_policies(
+        options.profile, options.reviewer_policies
+    )
     effective_cache_enabled = _effective_cache_enabled(
         options.profile, options.cache_enabled
     )
@@ -412,6 +459,7 @@ async def run_profile(
         agent_heartbeat_timeout_s=config.agent_heartbeat_timeout_s,
         seed=options.seed,
         bootstrap_seed=options.bootstrap_seed,
+        generation_seed_rule=GENERATION_SEED_RULE,
         concurrency=options.concurrency,
         repeats=options.repeats,
         started_at=started_at,
